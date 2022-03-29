@@ -18,18 +18,22 @@ INCTXT(wblocksLibMJS, "src/lib.mjs");
 
 #define WBLOCKS_BAR_CLASS "wblocks2_bar"
 
-HFONT defaultFont;
 JSClassID jsBlockClassId;
 UINT_PTR createWindowTimer;
 
 #define WBLOCKS_MAX_LEN 1024
+
+typedef struct {
+	HFONT handle;
+	size_t refCount;
+} fontref_t;
 
 typedef struct _wblock {
 	struct _wblock *tail, *head;
 	bool visible;
 	wchar_t text[WBLOCKS_MAX_LEN];
 	uint16_t textLen;
-	HFONT font;
+	fontref_t *font;
 	COLORREF color;
 	size_t padLeft, padRight;
 } wblock_t;
@@ -44,10 +48,25 @@ struct {
 } wb;
 
 wblock_t *headBlock = NULL;
+wblock_t defaultBlock = {
+	.visible = true,
+	.text = L"",
+	.textLen = 0,
+	.color = RGB(255, 255, 255),
+	.padLeft = 5,
+	.padRight = 5,
+};
 
 void err(const char *err)
 {
 	fprintf(stderr, "wblocks error: %s\n", err);
+}
+
+void *xmalloc(size_t sz)
+{
+	void *ptr = malloc(sz);
+	assert(ptr);
+	return ptr;
 }
 
 void updateBlocks(HWND wnd)
@@ -82,7 +101,7 @@ void updateBlocks(HWND wnd)
 	while (block) {
 		// Draw text
 		SetTextColor(wb.hdc, block->color),
-		SelectObject(wb.hdc, block->font);
+		SelectObject(wb.hdc, block->font->handle);
 		rect.right -= block->padRight;
 		DrawTextW(wb.hdc, block->text, block->textLen, &rect,
 				DT_NOCLIP | DT_NOPREFIX | DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
@@ -207,16 +226,11 @@ JSValue jsYieldToC(JSContext *ctx, JSValueConst this, int argc, JSValueConst *ar
 	return JS_UNDEFINED;
 }
 
-JSValue createBlock(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsCreateBlock(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
 {
-	wblock_t *block = malloc(sizeof(*block));
-	assert(block);
-	block->visible = true;
-	block->textLen = 0;
-	// TODO: allow setting defaults
-	block->font = defaultFont;
-	block->color = RGB(255, 255, 255);
-	block->padLeft = block->padRight = 5;
+	wblock_t *block = xmalloc(sizeof(wblock_t));
+	memcpy(block, &defaultBlock, sizeof(wblock_t));
+	block->font->refCount++;
 	block->head = NULL;
 	block->tail = headBlock;
 	if (headBlock) {
@@ -241,16 +255,19 @@ JSValue jsBlockSetFont(JSContext *ctx, JSValueConst this, int argc, JSValueConst
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
 	const char *str = JS_ToCString(ctx, argv[0]);
-	HFONT newFont = CreateFont(JS_VALUE_GET_INT(argv[1]), 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, str);
+	fontref_t *fr = xmalloc(sizeof(fontref_t));
+	fr->handle = CreateFont(JS_VALUE_GET_INT(argv[1]), 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, str);
+	fr->refCount++;
 	JS_FreeCString(ctx, str);
-	if (!newFont) {
+	if (!fr->handle) {
 		return JS_ThrowInternalError(ctx, "Failed to load font");
 	}
 	wblock_t *block = getBlockThis(this);
-	if (block->font != defaultFont) {
-		DeleteObject(block->font);
+	if (--block->font->refCount == 0) {
+		DeleteObject(block->font->handle);
+		free(block->font);
 	}
-	block->font = newFont;
+	block->font = fr;
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
 }
@@ -306,8 +323,14 @@ JSValue jsBlockSetVisible(JSContext *ctx, JSValueConst this, int argc, JSValueCo
 JSValue jsBlockRemove(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
 {
 	wblock_t *block = getBlockThis(this);
-	if (!block->head && headBlock != block) {
+	if (block == &defaultBlock) {
+		return JS_ThrowInternalError(ctx, "Cannot remove default block");
+	} else if (!block->head && headBlock != block) {
 		return JS_ThrowReferenceError(ctx, "Non-existent block");
+	}
+	if (--block->font->refCount == 0) {
+		DeleteObject(block->font->handle);
+		free(block->font);
 	}
 	if (block->head) {
 		block->head->tail = block->tail;
@@ -325,8 +348,10 @@ JSValue jsBlockRemove(JSContext *ctx, JSValueConst this, int argc, JSValueConst 
 int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdShow)
 {
 	// Load default font
-	defaultFont = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
-	assert(defaultFont);
+	defaultBlock.font = xmalloc(sizeof(fontref_t));
+	defaultBlock.font->handle = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
+	defaultBlock.font->refCount = 1;
+	assert(defaultBlock.font);
 
 	// Reg class
 	WNDCLASSEX wc = {0};
@@ -372,10 +397,15 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 		JS_SetClassProto(ctx, jsBlockClassId, proto);
 	}
 
+	// Create default block
+	JSValue jsDefaultBlock = JS_NewObjectClass(ctx, jsBlockClassId);
+	JS_SetOpaque(jsDefaultBlock, &defaultBlock);
+
 	// Add C API
 	{
 		JSValue global = JS_GetGlobalObject(ctx);
-		JS_SetPropertyStr(ctx, global, "createBlock", JS_NewCFunction(ctx, createBlock, "createBlock", 0));
+		JS_SetPropertyStr(ctx, global, "createBlock", JS_NewCFunction(ctx, jsCreateBlock, "createBlock", 0));
+		JS_SetPropertyStr(ctx, global, "defaultBlock", jsDefaultBlock);
 		JSValue wbc = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, global, "__wbc", wbc);
 		JS_FreeValue(ctx, global);
