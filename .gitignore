@@ -1,0 +1,5 @@
+compile_commands.json
+.cache/
+quickjs/
+*.exe
+wblocks.js
