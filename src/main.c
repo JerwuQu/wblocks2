@@ -147,17 +147,11 @@ void createWindow()
 		err("failed to find tray");
 		return;
 	}
-	const HWND rebar = FindWindowEx(tray, NULL, "ReBarWindow32", NULL);
-	if (!rebar) {
-		err("failed to find rebar");
-		return;
-	}
-	wb.bar = FindWindowEx(rebar, NULL, "MSTaskSwWClass", NULL);
+	wb.bar = FindWindowEx(tray, NULL, "ReBarWindow32", NULL);
 	if (!wb.bar) {
 		err("failed to find taskbar");
 		return;
 	}
-
 	// Create window
 	assert(CreateWindowEx(
 			WS_EX_LAYERED, WBLOCKS_BAR_CLASS, "wblocks2_bar",
