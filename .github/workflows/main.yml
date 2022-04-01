@@ -1,0 +1,38 @@
+name: Build
+on: [push]
+jobs:
+  build:
+    name: Ubuntu->Windows Cross Compile
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v1
+    - name: Install deps
+      run: sudo apt install gcc-mingw-w64-x86-64
+    - name: Build
+      run: CC=x86_64-w64-mingw32-gcc make
+    - name: Upload artifact
+      uses: actions/upload-artifact@master
+      with:
+        name: wblocks2
+        path: wblocks2.exe
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ci-${{ github.sha }}
+        release_name: CI build
+        draft: false
+        prerelease: false
+    - name: Upload release asset
+      id: upload-release-asset 
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: wblocks2.exe
+        asset_name: wblocks2.exe
+        asset_content_type: application/octet-stream
