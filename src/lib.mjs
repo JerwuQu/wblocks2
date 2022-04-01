@@ -15,4 +15,5 @@ globalThis.setInterval = (fn, interval) => {
 setInterval(__wbc.yieldToC, 10);
 setInterval(__wbc.checkBarSize, 100);
 
+// TODO: load all scripts within a `blocks` dir
 std.loadScript("wblocks.js");

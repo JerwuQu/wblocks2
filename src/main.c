@@ -57,6 +57,25 @@ wblock_t defaultBlock = {
 	.padRight = 5,
 };
 
+typedef struct _main_queue_item {
+	struct _main_queue_item *next;
+	void (*fn)(void*);
+	void *data;
+} main_queue_item_t;
+main_queue_item_t *mainQueueHead = NULL;
+HANDLE mainQueueMutex;
+
+typedef struct {
+	HANDLE thread;
+	JSValue resolve, reject;
+	JSContext *ctx;
+	char *cmd;
+
+	bool success;
+	char *result;
+} js_shell_thread_data_t;
+const char *jsShellTempCmd;
+
 void err(const char *err)
 {
 	fprintf(stderr, "wblocks error: %s\n", err);
@@ -67,6 +86,23 @@ void *xmalloc(size_t sz)
 	void *ptr = malloc(sz);
 	assert(ptr);
 	return ptr;
+}
+
+void xrealloc(void **ptr, size_t sz)
+{
+	*ptr = realloc(*ptr, sz);
+	assert(*ptr);
+}
+
+void mainQueueAppend(void (*fn)(void*), void *data)
+{
+	main_queue_item_t *new = xmalloc(sizeof(main_queue_item_t));
+	new->fn = fn;
+	new->data = data;
+	WaitForSingleObject(mainQueueMutex, INFINITE);
+	new->next = mainQueueHead;
+	mainQueueHead = new;
+	ReleaseMutex(mainQueueMutex);
 }
 
 void updateBlocks(HWND wnd)
@@ -212,6 +248,15 @@ JSValue jsYieldToC(JSContext *ctx, JSValueConst this, int argc, JSValueConst *ar
 		wb.needsUpdate = false;
 	}
 
+	WaitForSingleObject(mainQueueMutex, INFINITE);
+	while (mainQueueHead) {
+		mainQueueHead->fn(mainQueueHead->data);
+		main_queue_item_t *next = mainQueueHead->next;
+		free(mainQueueHead);
+		mainQueueHead = next;
+	}
+	ReleaseMutex(mainQueueMutex);
+
 	MSG msg;
 	while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
 		TranslateMessage(&msg);
@@ -339,6 +384,84 @@ JSValue jsBlockRemove(JSContext *ctx, JSValueConst this, int argc, JSValueConst 
 	return JS_UNDEFINED;
 }
 
+// The resolver for `jsShell` which resolves the Promise, ran on the main thread
+void jsShellResolve(void *data)
+{
+	js_shell_thread_data_t *td = data;
+	JSValue str = JS_NewString(td->ctx, td->result);
+	JS_FreeValue(td->ctx, JS_Call(td->ctx, td->success ? td->resolve : td->reject, JS_UNDEFINED, 1, &str));
+	JS_FreeValue(td->ctx, str);
+	JS_FreeValue(td->ctx, td->resolve);
+	JS_FreeValue(td->ctx, td->reject);
+	CloseHandle(td->thread);
+	free(td->cmd);
+	free(td->result);
+	free(td);
+}
+
+// The command runner for `jsShell`, ran on a different thread
+DWORD CALLBACK jsShellThread(LPVOID param)
+{
+	js_shell_thread_data_t *td = param;
+	FILE *f = popen(td->cmd, "rb");
+	if (!f) {
+		td->success = false;
+		td->result = strdup("failed to run command");
+		return 0;
+	}
+	char *buf = xmalloc(4096);
+	size_t len = 0, bread;
+	while ((bread = fread(buf, 1, 4096, f)) > 0) {
+		len += bread;
+		if (bread == 4096) {
+			xrealloc((void**)&buf, len + 4096);
+		}
+	}
+	fclose(f);
+	buf[len] = 0;
+	td->success = true;
+	td->result = buf;
+	mainQueueAppend(jsShellResolve, td);
+	return 0;
+}
+
+// The "lambda" put into the Promise constructor returned from `jsShell`, ran on the main thread
+JSValue jsShellPromiseCb(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+{
+	if (argc != 2 || !JS_IsFunction(ctx, argv[0]) || !JS_IsFunction(ctx, argv[1]) || !jsShellTempCmd) {
+		return JS_ThrowTypeError(ctx, "Invalid argument");
+	}
+	js_shell_thread_data_t *td = xmalloc(sizeof(js_shell_thread_data_t));
+	td->resolve = JS_DupValue(ctx, argv[0]);
+	td->reject = JS_DupValue(ctx, argv[1]);
+	td->ctx = ctx;
+	td->cmd = strdup(jsShellTempCmd);
+	JS_FreeCString(ctx, jsShellTempCmd);
+	jsShellTempCmd = NULL;
+	td->thread = CreateThread(NULL, 0, jsShellThread, td, CREATE_SUSPENDED, 0);
+	ResumeThread(td->thread);
+	return JS_UNDEFINED;
+}
+
+// Function the user calls from `$`
+JSValue jsShell(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+{
+	// TODO: make this a tag template function instead
+	if (argc != 1 || !JS_IsString(argv[0])) {
+		return JS_ThrowTypeError(ctx, "Invalid argument");
+	}
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue promiseClass = JS_GetPropertyStr(ctx, global, "Promise");
+	JSValue fn = JS_NewCFunction(ctx, jsShellPromiseCb, "$__callback", 2);
+	jsShellTempCmd = JS_ToCString(ctx, argv[0]);
+	JSValue promise = JS_CallConstructor(ctx, promiseClass, 1, &fn);
+	JS_FreeValue(ctx, fn);
+	assert(!jsShellTempCmd);
+	JS_FreeValue(ctx, promiseClass);
+	JS_FreeValue(ctx, global);
+	return promise;
+}
+
 int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdShow)
 {
 	// Load default font
@@ -346,6 +469,9 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 	defaultBlock.font->handle = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
 	defaultBlock.font->refCount = 1;
 	assert(defaultBlock.font);
+
+	// Create mutex
+	mainQueueMutex = CreateMutex(NULL, false, NULL);
 
 	// Reg class
 	WNDCLASSEX wc = {0};
@@ -400,6 +526,7 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 		JSValue global = JS_GetGlobalObject(ctx);
 		JS_SetPropertyStr(ctx, global, "createBlock", JS_NewCFunction(ctx, jsCreateBlock, "createBlock", 0));
 		JS_SetPropertyStr(ctx, global, "defaultBlock", jsDefaultBlock);
+		JS_SetPropertyStr(ctx, global, "$", JS_NewCFunction(ctx, jsShell, "$", 1));
 		JSValue wbc = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, global, "__wbc", wbc);
 		JS_FreeValue(ctx, global);
