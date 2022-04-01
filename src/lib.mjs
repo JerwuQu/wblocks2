@@ -15,5 +15,12 @@ globalThis.setInterval = (fn, interval) => {
 setInterval(__wbc.yieldToC, 10);
 setInterval(__wbc.checkBarSize, 100);
 
-// TODO: load all scripts within a `blocks` dir
-std.loadScript("wblocks.js");
+// Load all scripts within the `blocks` dir
+const [files, err] = os.readdir('./blocks');
+if (err) {
+	console.log('Failed to open directory "blocks", does it exist?');
+	std.exit(1);
+}
+files.filter(f => !f.startsWith('.')).forEach(script => {
+	std.loadScript('./blocks/' + script);
+});
