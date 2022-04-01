@@ -21,6 +21,6 @@ if (err) {
 	console.log('Failed to open directory "blocks", does it exist?');
 	std.exit(1);
 }
-files.filter(f => !f.startsWith('.')).forEach(script => {
+files.filter(f => !f.startsWith('.')).sort().forEach(script => {
 	std.loadScript('./blocks/' + script);
 });
