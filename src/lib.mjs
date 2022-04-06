@@ -15,6 +15,9 @@ globalThis.setInterval = (fn, interval) => {
 setInterval(__wbc.yieldToC, 10);
 setInterval(__wbc.checkBarSize, 100);
 
+// TODO: colored info, warn, error
+console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
+
 // Load all scripts within the `blocks` dir
 const [files, err] = os.readdir('./blocks');
 if (err) {
@@ -22,5 +25,17 @@ if (err) {
 	std.exit(1);
 }
 files.filter(f => !f.startsWith('.')).sort().forEach(script => {
-	std.loadScript('./blocks/' + script);
+	std.out.printf('Loading %s... ', script);
+	const data = std.loadFile('./blocks/' + script);
+	if (!data) {
+		throw 'Failed to load ' + data;
+	}
+	try {
+		(() => {
+			eval(data);
+		})();
+		std.out.printf('OK!\n');
+	} catch (ex) {
+		console.error(`Error running script '${script}':`, ex);
+	}
 });

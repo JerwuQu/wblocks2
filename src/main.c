@@ -135,16 +135,18 @@ void updateBlocks(HWND wnd)
 	SetBkMode(wb.hdc, TRANSPARENT);
 	wblock_t *block = headBlock;
 	while (block) {
-		// Draw text
-		SetTextColor(wb.hdc, block->color),
-		SelectObject(wb.hdc, block->font->handle);
-		rect.right -= block->padRight;
-		DrawTextW(wb.hdc, block->text, block->textLen, &rect,
-				DT_NOCLIP | DT_NOPREFIX | DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
-		RECT rectCalc = { .right = sz.cx, .bottom = sz.cy };
-		DrawTextW(wb.hdc, block->text, block->textLen, &rectCalc,
-				DT_NOCLIP | DT_NOPREFIX | DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_CALCRECT);
-		rect.right -= rectCalc.right + block->padLeft;
+		if (block->visible) {
+			// Draw text
+			SetTextColor(wb.hdc, block->color),
+			SelectObject(wb.hdc, block->font->handle);
+			rect.right -= block->padRight;
+			DrawTextW(wb.hdc, block->text, block->textLen, &rect,
+					DT_NOCLIP | DT_NOPREFIX | DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+			RECT rectCalc = { .right = sz.cx, .bottom = sz.cy };
+			DrawTextW(wb.hdc, block->text, block->textLen, &rectCalc,
+					DT_NOCLIP | DT_NOPREFIX | DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_CALCRECT);
+			rect.right -= rectCalc.right + block->padLeft;
+		}
 
 		block = block->tail; // Next
 	}
@@ -290,6 +292,7 @@ static inline wblock_t *getBlockThis(JSValueConst this)
 
 JSValue jsBlockSetFont(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
 {
+	// TODO: allow name only, using default size
 	if (argc != 2 || !JS_IsString(argv[0]) || !JS_IsNumber(argv[1])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
@@ -399,28 +402,62 @@ void jsShellResolve(void *data)
 	free(td);
 }
 
+char *runProcess(char *cmd)
+{
+	// Create pipes for menu
+	SECURITY_ATTRIBUTES sa = {
+		.nLength = sizeof(SECURITY_ATTRIBUTES),
+		.bInheritHandle = TRUE,
+	};
+	HANDLE stdoutR, stdoutW;
+	CreatePipe(&stdoutR, &stdoutW, &sa, 0);
+	assert(SetHandleInformation(stdoutR, HANDLE_FLAG_INHERIT, 0));
+
+	// Open menu
+	PROCESS_INFORMATION pi;
+	STARTUPINFO si = {
+		.cb = sizeof(STARTUPINFO),
+		.hStdOutput = stdoutW,
+		.hStdError = stdoutW,
+		.dwFlags = STARTF_USESTDHANDLES,
+	};
+	if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+		CloseHandle(stdoutR);
+		CloseHandle(stdoutW);
+		return NULL;
+	}
+	CloseHandle(stdoutW);
+
+	// Read output
+	char *buf = xmalloc(4096);
+	size_t len = 0;
+	DWORD bread;
+	while (ReadFile(stdoutR, buf + len, 4096, &bread, NULL)) {
+		len += bread;
+		xrealloc((void**)&buf, len + 4096);
+	}
+	buf[len] = 0;
+
+	// Clean up
+	CloseHandle(stdoutR);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+
+	return buf;
+}
+
 // The command runner for `jsShell`, ran on a different thread
 DWORD CALLBACK jsShellThread(LPVOID param)
 {
 	js_shell_thread_data_t *td = param;
-	FILE *f = popen(td->cmd, "rb");
-	if (!f) {
+	char *res = runProcess(td->cmd);
+	if (res) {
+		td->success = true;
+		td->result = res;
+	} else {
 		td->success = false;
 		td->result = strdup("failed to run command");
-		return 0;
 	}
-	char *buf = xmalloc(4096);
-	size_t len = 0, bread;
-	while ((bread = fread(buf, 1, 4096, f)) > 0) {
-		len += bread;
-		if (bread == 4096) {
-			xrealloc((void**)&buf, len + 4096);
-		}
-	}
-	fclose(f);
-	buf[len] = 0;
-	td->success = true;
-	td->result = buf;
 	mainQueueAppend(jsShellResolve, td);
 	return 0;
 }
@@ -468,7 +505,7 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 	defaultBlock.font = xmalloc(sizeof(fontref_t));
 	defaultBlock.font->handle = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
 	defaultBlock.font->refCount = 1;
-	assert(defaultBlock.font);
+	assert(defaultBlock.font->handle);
 
 	// Create mutex
 	mainQueueMutex = CreateMutex(NULL, false, NULL);
