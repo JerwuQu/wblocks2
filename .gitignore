@@ -3,3 +3,4 @@ compile_commands.json
 quickjs/
 *.exe
 blocks/
+wblocks.res

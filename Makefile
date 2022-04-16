@@ -4,8 +4,11 @@ DEP=$(wildcard src/*) quickjs
 
 .PHONY: clean run
 
-$(PROJ).exe: $(SRC) $(DEP)
-	x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Iquickjs/include -Lquickjs/lib/quickjs -o $@ $(SRC) -static -lgdi32 -lquickjs -pthread
+$(PROJ).exe: $(SRC) $(DEP) wblocks.res
+	x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Iquickjs/include -Lquickjs/lib/quickjs -o $@ $(SRC) wblocks.res -static -lgdi32 -lquickjs -pthread
+
+wblocks.res:
+	x86_64-w64-mingw32-windres wblocks.rc -O coff -o wblocks.res
 
 quickjs:
 	@echo 'Downloading quickjs...'
