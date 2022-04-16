@@ -12,6 +12,39 @@ globalThis.setInterval = (fn, interval) => {
 };
 // TODO: clearInterval
 
+globalThis.$quote = arg => {
+	// Sources:
+	// - https://stackoverflow.com/a/47469792
+	// - https://docs.microsoft.com/en-gb/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+	if (!(/[ \t\n\v]/.exec(arg))) {
+		return arg;
+	}
+	let str = '"';
+	for (let i = 0; i < arg.length; i++) {
+		let slashes = 0;
+		while (i < arg.length && arg[i] === '\\') {
+			slashes++;
+			i++;
+		}
+		if (i === arg.length) {
+			str += '\\'.repeat(slashes * 2);
+			break;
+		} else if (arg[i] === '"') {
+			str += '\\'.repeat(slashes * 2 + 1) + arg[i];
+		} else {
+			str += '\\'.repeat(slashes) + arg[i];
+		}
+	}
+	return str + '"';
+};
+
+globalThis.$ps = async cmd => await $(`powershell -Command ${globalThis.$quote(cmd)}`);
+
+globalThis.$psFetch = async url => {
+	const cmd = `$ProgressPreference='SilentlyContinue';$(Invoke-WebRequest '${url.replace(/'/g, "''")}').Content`;
+	return await globalThis.$ps(cmd);
+};
+
 setInterval(__wbc.yieldToC, 10);
 setInterval(__wbc.checkBarSize, 100);
 
