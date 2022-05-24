@@ -19,7 +19,7 @@ quickjs:
 	@echo 'OK.'
 
 clean:
-	rm -rf $(PROJ).exe quickjs
+	rm -rf $(PROJ).exe wblocks.res quickjs
 
 run: $(PROJ).exe
 	./$(PROJ).exe

@@ -20,6 +20,7 @@ INCTXT(wblocksLibMJS, "src/lib.mjs");
 
 JSClassID jsBlockClassId;
 UINT_PTR createWindowTimer;
+HINSTANCE hInst;
 
 #define WBLOCKS_MAX_LEN 1024
 
@@ -190,6 +191,7 @@ void createWindow()
 		err("failed to find taskbar");
 		return;
 	}
+
 	// Create window
 	assert(CreateWindowEx(
 			WS_EX_LAYERED, WBLOCKS_BAR_CLASS, "wblocks2_bar",
@@ -211,6 +213,16 @@ void initWnd(HWND wnd)
 	wb.hdc = CreateCompatibleDC(wb.screenHDC);
 	SetParent(wnd, wb.bar);
 	updateBlocks(wnd);
+
+	// Show tray icon
+	NOTIFYICONDATA notifData = {
+		.cbSize = sizeof(notifData),
+		.hWnd = wnd,
+		.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(100)),
+		.uFlags = NIF_ICON | NIF_TIP,
+		.szTip = "wblocks",
+	};
+	Shell_NotifyIcon(NIM_ADD, &notifData);
 }
 
 void cleanupWnd()
@@ -220,6 +232,8 @@ void cleanupWnd()
 	}
 	DeleteDC(wb.hdc);
 	ReleaseDC(NULL, wb.screenHDC);
+	NOTIFYICONDATA notifData = { .cbSize = sizeof(notifData), .hWnd = wb.wnd };
+	Shell_NotifyIcon(NIM_DELETE, &notifData);
 	memset(&wb, 0, sizeof(wb));
 	createWindowTimer = SetTimer(NULL, 0, 3000, (TIMERPROC)retryCreateWindow);
 }
@@ -501,6 +515,8 @@ JSValue jsShell(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
 
 int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdShow)
 {
+	hInst = inst;
+
 	// Load default font
 	defaultBlock.font = xmalloc(sizeof(fontref_t));
 	defaultBlock.font->handle = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
