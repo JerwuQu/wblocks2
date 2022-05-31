@@ -54,7 +54,7 @@ console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
 // Load all scripts within the `blocks` dir
 const [files, err] = os.readdir('./blocks');
 if (err) {
-	console.log('Failed to open directory "blocks", does it exist?');
+	console.error('Failed to open directory "blocks", does it exist?');
 	std.exit(1);
 }
 files.filter(f => !f.startsWith('.')).sort().forEach(script => {

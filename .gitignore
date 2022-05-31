@@ -4,3 +4,4 @@ quickjs/
 *.exe
 blocks/
 wblocks.res
+*.log

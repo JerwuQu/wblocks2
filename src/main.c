@@ -1,3 +1,8 @@
+// TODO:
+// - show context menu on tray icon (has 'Show Log', 'Reload' and 'Exit')
+// - click handlers for blocks
+// - bug with changing font of block also changing defaultBlock font *sometimes*...?, debug by logging fontrefs on render
+
 // Require Windows 10
 #define WINVER 0x0A00
 #define _WIN32_WINNT 0x0A00
@@ -7,6 +12,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <io.h>
 
 #include <quickjs/quickjs.h>
 #include <quickjs/quickjs-libc.h>
@@ -435,7 +441,7 @@ char *runProcess(char *cmd)
 		.hStdError = stdoutW,
 		.dwFlags = STARTF_USESTDHANDLES,
 	};
-	if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+	if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
 		CloseHandle(stdoutR);
 		CloseHandle(stdoutW);
 		return NULL;
@@ -516,6 +522,20 @@ JSValue jsShell(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
 int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdShow)
 {
 	hInst = inst;
+
+	// Create console and redirect output
+	assert(AllocConsole());
+#ifdef DEBUG
+	assert(freopen("CONOUT$", "w", stdout));
+	assert(freopen("CONOUT$", "w", stderr));
+#else
+	ShowWindow(GetConsoleWindow(), 0);
+	assert(freopen("wblocks.log", "w", stdout));
+	assert(freopen("NUL", "w", stderr));
+	assert(!_dup2(_fileno(stdout), _fileno(stderr)));
+#endif
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
 
 	// Load default font
 	defaultBlock.font = xmalloc(sizeof(fontref_t));
