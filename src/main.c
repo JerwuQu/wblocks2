@@ -1,5 +1,4 @@
 // TODO:
-// - show context menu on tray icon (has 'Show Log', 'Reload' and 'Exit')
 // - click handlers for blocks
 // - bug with changing font of block also changing defaultBlock font *sometimes*...?, debug by logging fontrefs on render
 
@@ -23,12 +22,19 @@
 INCTXT(wblocksLibMJS, "src/lib.mjs");
 
 #define WBLOCKS_BAR_CLASS "wblocks2_bar"
+#define WM_WBLOCKS_TRAY (WM_USER + 1)
+
+#define TRAY_MENU_SHOW_LOG 1
+#define TRAY_MENU_RELOAD_SCRIPTS 2
+#define TRAY_MENU_EXIT 3
+
+#define WBLOCKS_MAX_LEN 1024
+
+#define WBLOCKS_LOGFILE "wblocks.log"
 
 JSClassID jsBlockClassId;
 UINT_PTR createWindowTimer;
 HINSTANCE hInst;
-
-#define WBLOCKS_MAX_LEN 1024
 
 typedef struct {
 	HFONT handle;
@@ -225,8 +231,9 @@ void initWnd(HWND wnd)
 		.cbSize = sizeof(notifData),
 		.hWnd = wnd,
 		.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(100)),
-		.uFlags = NIF_ICON | NIF_TIP,
+		.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
 		.szTip = "wblocks",
+		.uCallbackMessage = WM_WBLOCKS_TRAY,
 	};
 	Shell_NotifyIcon(NIM_ADD, &notifData);
 }
@@ -258,6 +265,28 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		cleanupWnd();
 		err("wblocks window died, probably due to explorer.exe crashing");
 		break;
+	case WM_WBLOCKS_TRAY:
+		if (LOWORD(lParam) == WM_LBUTTONUP || LOWORD(lParam) == WM_RBUTTONUP) {
+			POINT pt;
+			GetCursorPos(&pt);
+			HMENU hmenu = CreatePopupMenu();
+			InsertMenu(hmenu, 0, MF_BYPOSITION | MF_STRING, TRAY_MENU_SHOW_LOG, "Show Log");
+			// TODO: InsertMenu(hmenu, 1, MF_BYPOSITION | MF_STRING, TRAY_MENU_RELOAD_SCRIPTS, "Reload Scripts");
+			InsertMenu(hmenu, 2, MF_BYPOSITION | MF_STRING, TRAY_MENU_EXIT, "Exit");
+			SetForegroundWindow(wnd);
+			int cmd = TrackPopupMenu(hmenu,
+					TPM_LEFTALIGN | TPM_LEFTBUTTON | TPM_BOTTOMALIGN | TPM_NONOTIFY | TPM_RETURNCMD,
+					pt.x, pt.y, 0, wnd, NULL);
+			PostMessage(wnd, WM_NULL, 0, 0);
+			if (cmd == TRAY_MENU_SHOW_LOG) {
+				ShellExecute(NULL, NULL, WBLOCKS_LOGFILE, NULL, NULL, SW_SHOWNORMAL);
+			} else if (cmd == TRAY_MENU_RELOAD_SCRIPTS) {
+				// TODO
+			} else if (cmd == TRAY_MENU_EXIT) {
+				cleanupWnd();
+				exit(0);
+			}
+		}
 	}
 
 	return DefWindowProc(wnd, msg, wParam, lParam);
@@ -530,7 +559,7 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 	assert(freopen("CONOUT$", "w", stderr));
 #else
 	ShowWindow(GetConsoleWindow(), 0);
-	assert(freopen("wblocks.log", "w", stdout));
+	assert(freopen(WBLOCKS_LOGFILE, "w", stdout));
 	assert(freopen("NUL", "w", stderr));
 	assert(!_dup2(_fileno(stdout), _fileno(stderr)));
 #endif
