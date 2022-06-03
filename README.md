@@ -1,8 +1,6 @@
 # wblocks2
 
-Electric boogaloo
-
-API not stable, but it works somewhat
+Scriptable taskbar blocks
 
 ## Functions
 
@@ -20,6 +18,7 @@ Block functions:
   - `block.setColor(r, g, b)`
   - `block.setPadding(left, right)`
   - `block.setVisible(bool)`
+  - `block.clone(keepVisibility=false)`
   - `block.remove()`
 
 ## License

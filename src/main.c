@@ -1,5 +1,4 @@
 // TODO:
-// - give blocks a `<block>.clone([keep-visibility=false])`
 // - some way to reload scripts... maybe just restart process until it is figured out
 // - click handlers for blocks
 
@@ -317,10 +316,10 @@ JSValue jsYieldToC(JSContext *ctx, JSValueConst this, int argc, JSValueConst *ar
 	return JS_UNDEFINED;
 }
 
-JSValue jsCreateBlock(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue createJSBlockFromSrc(JSContext *ctx, wblock_t *srcBlock)
 {
 	wblock_t *block = xmalloc(sizeof(wblock_t));
-	memcpy(block, &defaultBlock, sizeof(wblock_t));
+	memcpy(block, srcBlock, sizeof(wblock_t));
 	block->font->refCount++;
 	block->head = NULL;
 	block->tail = headBlock;
@@ -333,6 +332,11 @@ JSValue jsCreateBlock(JSContext *ctx, JSValueConst this, int argc, JSValueConst 
 	JSValue obj = JS_NewObjectClass(ctx, jsBlockClassId);
 	JS_SetOpaque(obj, block);
 	return obj;
+}
+
+JSValue jsCreateBlock(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+{
+	return createJSBlockFromSrc(ctx, &defaultBlock);
 }
 
 static inline wblock_t *getBlockThis(JSValueConst this)
@@ -410,6 +414,22 @@ JSValue jsBlockSetVisible(JSContext *ctx, JSValueConst this, int argc, JSValueCo
 	getBlockThis(this)->visible = JS_VALUE_GET_BOOL(argv[0]);
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
+}
+
+JSValue jsBlockClone(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+{
+	bool keepVisibility = false;
+	if (argc >= 1) {
+		if (!JS_IsBool(argv[0])) {
+			return JS_ThrowTypeError(ctx, "Invalid argument");
+		}
+		keepVisibility = JS_VALUE_GET_BOOL(argv[0]);
+	}
+	JSValue jsBlock = createJSBlockFromSrc(ctx, getBlockThis(this));
+	if (!keepVisibility) {
+		getBlockThis(jsBlock)->visible = true;
+	}
+	return jsBlock;
 }
 
 JSValue jsBlockRemove(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
@@ -614,6 +634,7 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 			JS_CFUNC_DEF("setColor", 3, jsBlockSetColor ),
 			JS_CFUNC_DEF("setPadding", 2, jsBlockSetPadding ),
 			JS_CFUNC_DEF("setVisible", 1, jsBlockSetVisible ),
+			JS_CFUNC_DEF("clone", 1, jsBlockClone ),
 			JS_CFUNC_DEF("remove", 0, jsBlockRemove ),
 		};
 		JS_SetPropertyFunctionList(ctx, proto, protoFuncs, 6);
