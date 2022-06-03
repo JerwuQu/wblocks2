@@ -20,6 +20,7 @@ Block functions:
   - `block.setColor(r, g, b)`
   - `block.setPadding(left, right)`
   - `block.setVisible(bool)`
+  - `block.clone(keepSourceVisibility)`
   - `block.remove()`
 
 ## License
