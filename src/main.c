@@ -1,6 +1,7 @@
 // TODO:
+// - give blocks a `<block>.clone([keep-visibility=false])`
+// - some way to reload scripts... maybe just restart process until it is figured out
 // - click handlers for blocks
-// - bug with changing font of block also changing defaultBlock font *sometimes*...?, debug by logging fontrefs on render
 
 // Require Windows 10
 #define WINVER 0x0A00
@@ -271,7 +272,7 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			GetCursorPos(&pt);
 			HMENU hmenu = CreatePopupMenu();
 			InsertMenu(hmenu, 0, MF_BYPOSITION | MF_STRING, TRAY_MENU_SHOW_LOG, "Show Log");
-			// TODO: InsertMenu(hmenu, 1, MF_BYPOSITION | MF_STRING, TRAY_MENU_RELOAD_SCRIPTS, "Reload Scripts");
+			InsertMenu(hmenu, 1, MF_BYPOSITION | MF_STRING, TRAY_MENU_RELOAD_SCRIPTS, "Reload Scripts");
 			InsertMenu(hmenu, 2, MF_BYPOSITION | MF_STRING, TRAY_MENU_EXIT, "Exit");
 			SetForegroundWindow(wnd);
 			int cmd = TrackPopupMenu(hmenu,
@@ -281,7 +282,7 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			if (cmd == TRAY_MENU_SHOW_LOG) {
 				ShellExecute(NULL, NULL, WBLOCKS_LOGFILE, NULL, NULL, SW_SHOWNORMAL);
 			} else if (cmd == TRAY_MENU_RELOAD_SCRIPTS) {
-				// TODO
+				MessageBoxA(0, "TODO", "TODO", 0); // TODO
 			} else if (cmd == TRAY_MENU_EXIT) {
 				cleanupWnd();
 				exit(0);
@@ -341,14 +342,14 @@ static inline wblock_t *getBlockThis(JSValueConst this)
 
 JSValue jsBlockSetFont(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
 {
-	// TODO: allow name only, using default size
+	// TODO: make size an optional parameter, retaining size if not given
 	if (argc != 2 || !JS_IsString(argv[0]) || !JS_IsNumber(argv[1])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
 	const char *str = JS_ToCString(ctx, argv[0]);
 	fontref_t *fr = xmalloc(sizeof(fontref_t));
 	fr->handle = CreateFont(JS_VALUE_GET_INT(argv[1]), 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, str);
-	fr->refCount++;
+	fr->refCount = 1;
 	JS_FreeCString(ctx, str);
 	if (!fr->handle) {
 		return JS_ThrowInternalError(ctx, "Failed to load font");
@@ -532,7 +533,7 @@ JSValue jsShellPromiseCb(JSContext *ctx, JSValueConst this, int argc, JSValueCon
 // Function the user calls from `$`
 JSValue jsShell(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
 {
-	// TODO: make this a tag template function instead
+	// TODO: make this a tag template function instead...?
 	if (argc != 1 || !JS_IsString(argv[0])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
