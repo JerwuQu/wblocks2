@@ -1,5 +1,4 @@
 // TODO:
-// - some way to reload scripts... maybe just restart process until it is figured out
 // - click handlers for blocks
 
 // Require Windows 10
@@ -25,7 +24,7 @@ INCTXT(wblocksLibMJS, "src/lib.mjs");
 #define WM_WBLOCKS_TRAY (WM_USER + 1)
 
 #define TRAY_MENU_SHOW_LOG 1
-#define TRAY_MENU_RELOAD_SCRIPTS 2
+#define TRAY_MENU_RESTART 2
 #define TRAY_MENU_EXIT 3
 
 #define WBLOCKS_MAX_LEN 1024
@@ -251,6 +250,17 @@ void cleanupWnd()
 	createWindowTimer = SetTimer(NULL, 0, 3000, (TIMERPROC)retryCreateWindow);
 }
 
+void restartProgram()
+{
+	STARTUPINFO si;
+	GetStartupInfo(&si);
+	TCHAR szPath[MAX_PATH + 1];
+	GetModuleFileName(NULL, szPath, MAX_PATH);
+	PROCESS_INFORMATION pi;
+	assert(CreateProcess(szPath, GetCommandLine(), NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi));
+	exit(0);
+}
+
 LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 #ifdef DEBUG
@@ -271,7 +281,7 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			GetCursorPos(&pt);
 			HMENU hmenu = CreatePopupMenu();
 			InsertMenu(hmenu, 0, MF_BYPOSITION | MF_STRING, TRAY_MENU_SHOW_LOG, "Show Log");
-			InsertMenu(hmenu, 1, MF_BYPOSITION | MF_STRING, TRAY_MENU_RELOAD_SCRIPTS, "Reload Scripts");
+			InsertMenu(hmenu, 1, MF_BYPOSITION | MF_STRING, TRAY_MENU_RESTART, "Restart");
 			InsertMenu(hmenu, 2, MF_BYPOSITION | MF_STRING, TRAY_MENU_EXIT, "Exit");
 			SetForegroundWindow(wnd);
 			int cmd = TrackPopupMenu(hmenu,
@@ -280,8 +290,9 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			PostMessage(wnd, WM_NULL, 0, 0);
 			if (cmd == TRAY_MENU_SHOW_LOG) {
 				ShellExecute(NULL, NULL, WBLOCKS_LOGFILE, NULL, NULL, SW_SHOWNORMAL);
-			} else if (cmd == TRAY_MENU_RELOAD_SCRIPTS) {
-				MessageBoxA(0, "TODO", "TODO", 0); // TODO
+			} else if (cmd == TRAY_MENU_RESTART) {
+				cleanupWnd();
+				restartProgram(); // TODO: opt for proper reload instead
 			} else if (cmd == TRAY_MENU_EXIT) {
 				cleanupWnd();
 				exit(0);
