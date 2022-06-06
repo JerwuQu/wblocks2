@@ -23,6 +23,7 @@ INCTXT(wblocksLibMJS, "src/lib.mjs");
 #include <memory>
 #include <algorithm>
 #include <optional>
+#include <queue>
 
 #define WBLOCKS_BAR_CLASS "wblocks2_bar"
 #define WM_WBLOCKS_TRAY (WM_USER + 1)
@@ -44,11 +45,9 @@ HINSTANCE hInst;
 
 struct FontRef {
 	HFONT handle;
-
 	FontRef(HFONT handle) : handle(handle) {};
-
 	~FontRef() {
-
+		DeleteObject(handle);
 	}
 };
 
@@ -73,39 +72,27 @@ struct {
 std::vector<Block*> blocks;
 Block defaultBlock;
 
-struct main_queue_item {
-	struct main_queue_item *next;
+struct ThreadQueueTask {
 	void (*fn)(void*);
 	void *data;
 };
-main_queue_item *mainQueueHead = NULL;
-HANDLE mainQueueMutex;
+std::queue<ThreadQueueTask> mainThreadQueue;
+HANDLE mainThreadQueueMutex;
 
-typedef struct {
+struct js_shell_thread_data {
 	HANDLE thread;
-	JSValue resolve, reject;
+	JSValue resolveFn, rejectFn;
 	JSContext *ctx;
 	std::string cmd;
 
 	bool success;
 	std::string result;
-} js_shell_thread_data_t;
+};
 const char *jsShellTempCmd;
 
 void err(const char *err)
 {
 	fprintf(stderr, "wblocks error: %s\n", err);
-}
-
-void mainQueueAppend(void (*fn)(void*), void *data)
-{
-	auto item = new main_queue_item();
-	item->fn = fn;
-	item->data = data;
-	WaitForSingleObject(mainQueueMutex, INFINITE);
-	item->next = mainQueueHead;
-	mainQueueHead = item;
-	ReleaseMutex(mainQueueMutex);
 }
 
 void updateBlocks(HWND wnd)
@@ -298,14 +285,13 @@ JSValue jsYieldToC(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *ar
 		wb.needsUpdate = false;
 	}
 
-	WaitForSingleObject(mainQueueMutex, INFINITE);
-	while (mainQueueHead) {
-		mainQueueHead->fn(mainQueueHead->data);
-		main_queue_item *next = mainQueueHead->next;
-		delete mainQueueHead;
-		mainQueueHead = next;
+	WaitForSingleObject(mainThreadQueueMutex, INFINITE);
+	while (!mainThreadQueue.empty()) {
+		auto& item = mainThreadQueue.front();
+		item.fn(item.data);
+		mainThreadQueue.pop();
 	}
-	ReleaseMutex(mainQueueMutex);
+	ReleaseMutex(mainThreadQueueMutex);
 
 	MSG msg;
 	while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -434,12 +420,13 @@ JSValue jsBlockRemove(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst 
 // The resolver for `jsShell` which resolves the Promise, ran on the main thread
 void jsShellResolve(void *data)
 {
-	js_shell_thread_data_t *td = (js_shell_thread_data_t*)data;
+	auto *td = (js_shell_thread_data*)data;
 	JSValue str = JS_NewString(td->ctx, td->result.c_str());
-	JS_FreeValue(td->ctx, JS_Call(td->ctx, td->success ? td->resolve : td->reject, JS_UNDEFINED, 1, &str));
+	JSValue resp = JS_Call(td->ctx, td->success ? td->resolveFn : td->rejectFn, JS_UNDEFINED, 1, &str);
+	JS_FreeValue(td->ctx, resp);
 	JS_FreeValue(td->ctx, str);
-	JS_FreeValue(td->ctx, td->resolve);
-	JS_FreeValue(td->ctx, td->reject);
+	JS_FreeValue(td->ctx, td->resolveFn);
+	JS_FreeValue(td->ctx, td->rejectFn);
 	CloseHandle(td->thread);
 	delete td;
 }
@@ -483,14 +470,13 @@ std::optional<std::string> runProcess(std::string& cmd)
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
 
-	
 	return std::make_optional<std::string>(output);
 }
 
 // The command runner for `jsShell`, ran on a different thread
 DWORD CALLBACK jsShellThread(LPVOID param)
 {
-	js_shell_thread_data_t *td = (js_shell_thread_data_t*)param;
+	auto *td = (js_shell_thread_data*)param;
 	auto res = runProcess(td->cmd);
 	if (res.has_value()) {
 		td->success = true;
@@ -499,7 +485,12 @@ DWORD CALLBACK jsShellThread(LPVOID param)
 		td->success = false;
 		td->result = strdup("failed to run command");
 	}
-	mainQueueAppend(jsShellResolve, td);
+	WaitForSingleObject(mainThreadQueueMutex, INFINITE);
+	mainThreadQueue.emplace(ThreadQueueTask {
+		.fn = jsShellResolve,
+		.data = td,
+	});
+	ReleaseMutex(mainThreadQueueMutex);
 	return 0;
 }
 
@@ -509,9 +500,9 @@ JSValue jsShellPromiseCb(JSContext *ctx, JSValueConst thiz, int argc, JSValueCon
 	if (argc != 2 || !JS_IsFunction(ctx, argv[0]) || !JS_IsFunction(ctx, argv[1]) || !jsShellTempCmd) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
-	auto td = new js_shell_thread_data_t();
-	td->resolve = JS_DupValue(ctx, argv[0]);
-	td->reject = JS_DupValue(ctx, argv[1]);
+	auto td = new js_shell_thread_data();
+	td->resolveFn = JS_DupValue(ctx, argv[0]);
+	td->rejectFn = JS_DupValue(ctx, argv[1]);
 	td->ctx = ctx;
 	td->cmd = std::string(jsShellTempCmd);
 	JS_FreeCString(ctx, jsShellTempCmd);
@@ -564,7 +555,7 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 	defaultBlock.font = std::make_shared<FontRef>(hfont);
 
 	// Create mutex
-	mainQueueMutex = CreateMutex(NULL, false, NULL);
+	mainThreadQueueMutex = CreateMutex(NULL, false, NULL);
 
 	// Reg class
 	WNDCLASSEX wc = {0};
