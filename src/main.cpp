@@ -5,10 +5,8 @@
 #define WINVER 0x0A00
 #define _WIN32_WINNT 0x0A00
 
+extern "C" {
 #include <windows.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
 #include <assert.h>
 #include <io.h>
 
@@ -19,6 +17,12 @@
 #define INCBIN_STYLE INCBIN_STYLE_SNAKE
 #include "incbin.h"
 INCTXT(wblocksLibMJS, "src/lib.mjs");
+}
+
+#include <vector>
+#include <memory>
+#include <algorithm>
+#include <optional>
 
 #define WBLOCKS_BAR_CLASS "wblocks2_bar"
 #define WM_WBLOCKS_TRAY (WM_USER + 1)
@@ -31,24 +35,31 @@ INCTXT(wblocksLibMJS, "src/lib.mjs");
 
 #define WBLOCKS_LOGFILE "wblocks.log"
 
+#define QJS_SET_PROP_FN(ctx, obj, name, fn, len) \
+	JS_SetPropertyStr(ctx, obj, name, JS_NewCFunction(ctx, fn, name, len))
+
 JSClassID jsBlockClassId;
 UINT_PTR createWindowTimer;
 HINSTANCE hInst;
 
-typedef struct {
+struct FontRef {
 	HFONT handle;
-	size_t refCount;
-} fontref_t;
 
-typedef struct _wblock {
-	struct _wblock *tail, *head;
-	bool visible;
-	wchar_t text[WBLOCKS_MAX_LEN];
-	uint16_t textLen;
-	fontref_t *font;
-	COLORREF color;
-	size_t padLeft, padRight;
-} wblock_t;
+	FontRef(HFONT handle) : handle(handle) {};
+
+	~FontRef() {
+
+	}
+};
+
+struct Block {
+	bool visible = true;
+	wchar_t text[WBLOCKS_MAX_LEN] = L"";
+	uint16_t textLen = 0;
+	COLORREF color = RGB(255, 255, 255);
+	size_t padLeft = 5, padRight = 5;
+	std::shared_ptr<FontRef> font;
+};
 
 struct {
 	bool needsUpdate;
@@ -59,32 +70,25 @@ struct {
 	RECT barRect;
 } wb;
 
-wblock_t *headBlock = NULL;
-wblock_t defaultBlock = {
-	.visible = true,
-	.text = L"",
-	.textLen = 0,
-	.color = RGB(255, 255, 255),
-	.padLeft = 5,
-	.padRight = 5,
-};
+std::vector<Block*> blocks;
+Block defaultBlock;
 
-typedef struct _main_queue_item {
-	struct _main_queue_item *next;
+struct main_queue_item {
+	struct main_queue_item *next;
 	void (*fn)(void*);
 	void *data;
-} main_queue_item_t;
-main_queue_item_t *mainQueueHead = NULL;
+};
+main_queue_item *mainQueueHead = NULL;
 HANDLE mainQueueMutex;
 
 typedef struct {
 	HANDLE thread;
 	JSValue resolve, reject;
 	JSContext *ctx;
-	char *cmd;
+	std::string cmd;
 
 	bool success;
-	char *result;
+	std::string result;
 } js_shell_thread_data_t;
 const char *jsShellTempCmd;
 
@@ -93,27 +97,14 @@ void err(const char *err)
 	fprintf(stderr, "wblocks error: %s\n", err);
 }
 
-void *xmalloc(size_t sz)
-{
-	void *ptr = malloc(sz);
-	assert(ptr);
-	return ptr;
-}
-
-void xrealloc(void **ptr, size_t sz)
-{
-	*ptr = realloc(*ptr, sz);
-	assert(*ptr);
-}
-
 void mainQueueAppend(void (*fn)(void*), void *data)
 {
-	main_queue_item_t *new = xmalloc(sizeof(main_queue_item_t));
-	new->fn = fn;
-	new->data = data;
+	auto item = new main_queue_item();
+	item->fn = fn;
+	item->data = data;
 	WaitForSingleObject(mainQueueMutex, INFINITE);
-	new->next = mainQueueHead;
-	mainQueueHead = new;
+	item->next = mainQueueHead;
+	mainQueueHead = item;
 	ReleaseMutex(mainQueueMutex);
 }
 
@@ -145,8 +136,7 @@ void updateBlocks(HWND wnd)
 
 	// Draw blocks
 	SetBkMode(wb.hdc, TRANSPARENT);
-	wblock_t *block = headBlock;
-	while (block) {
+	std::for_each(blocks.rbegin(), blocks.rend(), [&rect, &sz](const auto& block) {
 		if (block->visible) {
 			// Draw text
 			SetTextColor(wb.hdc, block->color),
@@ -159,9 +149,7 @@ void updateBlocks(HWND wnd)
 					DT_NOCLIP | DT_NOPREFIX | DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_CALCRECT);
 			rect.right -= rectCalc.right + block->padLeft;
 		}
-
-		block = block->tail; // Next
-	}
+	});
 
 	// Update
 	POINT ptSrc = {0, 0};
@@ -173,7 +161,7 @@ void updateBlocks(HWND wnd)
 	UpdateLayeredWindow(wnd, wb.screenHDC, &pt, &sz, wb.hdc, &ptSrc, 0, &blendfn, ULW_ALPHA);
 }
 
-JSValue jsCheckBarSize(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsCheckBarSize(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	if (wb.wnd) {
 		RECT cmpRect;
@@ -229,11 +217,11 @@ void initWnd(HWND wnd)
 	NOTIFYICONDATA notifData = {
 		.cbSize = sizeof(notifData),
 		.hWnd = wnd,
-		.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(100)),
 		.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
-		.szTip = "wblocks",
 		.uCallbackMessage = WM_WBLOCKS_TRAY,
+		.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(100)),
 	};
+	memcpy(notifData.szTip, "wblocks\0", sizeof("wblocks") + 1);
 	Shell_NotifyIcon(NIM_ADD, &notifData);
 }
 
@@ -303,7 +291,7 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	return DefWindowProc(wnd, msg, wParam, lParam);
 }
 
-JSValue jsYieldToC(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsYieldToC(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	if (wb.wnd && wb.needsUpdate) {
 		updateBlocks(wb.wnd);
@@ -313,8 +301,8 @@ JSValue jsYieldToC(JSContext *ctx, JSValueConst this, int argc, JSValueConst *ar
 	WaitForSingleObject(mainQueueMutex, INFINITE);
 	while (mainQueueHead) {
 		mainQueueHead->fn(mainQueueHead->data);
-		main_queue_item_t *next = mainQueueHead->next;
-		free(mainQueueHead);
+		main_queue_item *next = mainQueueHead->next;
+		delete mainQueueHead;
 		mainQueueHead = next;
 	}
 	ReleaseMutex(mainQueueMutex);
@@ -327,107 +315,94 @@ JSValue jsYieldToC(JSContext *ctx, JSValueConst this, int argc, JSValueConst *ar
 	return JS_UNDEFINED;
 }
 
-JSValue createJSBlockFromSrc(JSContext *ctx, wblock_t *srcBlock)
+JSValue createJSBlockFromSrc(JSContext *ctx, Block *srcBlock)
 {
-	wblock_t *block = xmalloc(sizeof(wblock_t));
-	memcpy(block, srcBlock, sizeof(wblock_t));
-	block->font->refCount++;
-	block->head = NULL;
-	block->tail = headBlock;
-	if (headBlock) {
-		headBlock->head = block;
-	}
-	headBlock = block;
+	Block *block = new Block(*srcBlock);
 	wb.needsUpdate = true;
-
 	JSValue obj = JS_NewObjectClass(ctx, jsBlockClassId);
 	JS_SetOpaque(obj, block);
+	blocks.push_back(block);
 	return obj;
 }
 
-JSValue jsCreateBlock(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsCreateBlock(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	return createJSBlockFromSrc(ctx, &defaultBlock);
 }
 
-static inline wblock_t *getBlockThis(JSValueConst this)
+static inline Block *getBlockThis(JSValueConst thiz)
 {
-	return JS_GetOpaque(this, jsBlockClassId);
+	return (Block*)JS_GetOpaque(thiz, jsBlockClassId);
 }
 
-JSValue jsBlockSetFont(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsBlockSetFont(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	// TODO: make size an optional parameter, retaining size if not given
 	if (argc != 2 || !JS_IsString(argv[0]) || !JS_IsNumber(argv[1])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
 	const char *str = JS_ToCString(ctx, argv[0]);
-	fontref_t *fr = xmalloc(sizeof(fontref_t));
-	fr->handle = CreateFont(JS_VALUE_GET_INT(argv[1]), 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, str);
-	fr->refCount = 1;
+	HFONT handle = CreateFont(JS_VALUE_GET_INT(argv[1]), 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, str);
 	JS_FreeCString(ctx, str);
-	if (!fr->handle) {
+	if (!handle) {
 		return JS_ThrowInternalError(ctx, "Failed to load font");
 	}
-	wblock_t *block = getBlockThis(this);
-	if (--block->font->refCount == 0) {
-		DeleteObject(block->font->handle);
-		free(block->font);
-	}
-	block->font = fr;
+	auto ref = std::make_shared<FontRef>(handle);
+	auto block = getBlockThis(thiz);
+	block->font = ref;
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
 }
 
-JSValue jsBlockSetText(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsBlockSetText(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	if (argc != 1 || !JS_IsString(argv[0])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
 	size_t len;
 	const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
-	wblock_t *block = getBlockThis(this);
+	auto block = getBlockThis(thiz);
 	block->textLen = MultiByteToWideChar(CP_UTF8, MB_PRECOMPOSED, str, len, block->text, WBLOCKS_MAX_LEN);
 	JS_FreeCString(ctx, str);
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
 }
 
-JSValue jsBlockSetColor(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsBlockSetColor(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	if (argc != 3 || !JS_IsNumber(argv[0]) || !JS_IsNumber(argv[1]) || !JS_IsNumber(argv[2])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
-	getBlockThis(this)->color = JS_VALUE_GET_INT(argv[0])
+	getBlockThis(thiz)->color = JS_VALUE_GET_INT(argv[0])
 		| (JS_VALUE_GET_INT(argv[1]) << 8)
 		| (JS_VALUE_GET_INT(argv[2]) << 16);
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
 }
 
-JSValue jsBlockSetPadding(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsBlockSetPadding(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	if (argc != 2 || !JS_IsNumber(argv[0]) || !JS_IsNumber(argv[1])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
-	wblock_t *block = getBlockThis(this);
+	auto block = getBlockThis(thiz);
 	block->padLeft = JS_VALUE_GET_INT(argv[0]);
 	block->padRight = JS_VALUE_GET_INT(argv[1]);
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
 }
 
-JSValue jsBlockSetVisible(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsBlockSetVisible(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	if (argc != 1 || !JS_IsBool(argv[0])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
-	getBlockThis(this)->visible = JS_VALUE_GET_BOOL(argv[0]);
+	getBlockThis(thiz)->visible = JS_VALUE_GET_BOOL(argv[0]);
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
 }
 
-JSValue jsBlockClone(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsBlockClone(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	bool keepVisibility = false;
 	if (argc >= 1) {
@@ -436,34 +411,22 @@ JSValue jsBlockClone(JSContext *ctx, JSValueConst this, int argc, JSValueConst *
 		}
 		keepVisibility = JS_VALUE_GET_BOOL(argv[0]);
 	}
-	JSValue jsBlock = createJSBlockFromSrc(ctx, getBlockThis(this));
+	JSValue jsBlock = createJSBlockFromSrc(ctx, getBlockThis(thiz));
 	if (!keepVisibility) {
 		getBlockThis(jsBlock)->visible = true;
 	}
 	return jsBlock;
 }
 
-JSValue jsBlockRemove(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsBlockRemove(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
-	wblock_t *block = getBlockThis(this);
+	auto block = getBlockThis(thiz);
 	if (block == &defaultBlock) {
 		return JS_ThrowInternalError(ctx, "Cannot remove default block");
-	} else if (!block->head && headBlock != block) {
+	} else if (!std::count(blocks.begin(), blocks.end(), block)) {
 		return JS_ThrowReferenceError(ctx, "Non-existent block");
 	}
-	if (--block->font->refCount == 0) {
-		DeleteObject(block->font->handle);
-		free(block->font);
-	}
-	if (block->head) {
-		block->head->tail = block->tail;
-	} else {
-		headBlock = block->tail;
-	}
-	if (block->tail) {
-		block->tail->head = block->head;
-	}
-	block->head = block->tail = NULL;
+	blocks.erase(std::remove(blocks.begin(), blocks.end(), block), blocks.end());
 	wb.needsUpdate = true;
 	return JS_UNDEFINED;
 }
@@ -471,19 +434,17 @@ JSValue jsBlockRemove(JSContext *ctx, JSValueConst this, int argc, JSValueConst 
 // The resolver for `jsShell` which resolves the Promise, ran on the main thread
 void jsShellResolve(void *data)
 {
-	js_shell_thread_data_t *td = data;
-	JSValue str = JS_NewString(td->ctx, td->result);
+	js_shell_thread_data_t *td = (js_shell_thread_data_t*)data;
+	JSValue str = JS_NewString(td->ctx, td->result.c_str());
 	JS_FreeValue(td->ctx, JS_Call(td->ctx, td->success ? td->resolve : td->reject, JS_UNDEFINED, 1, &str));
 	JS_FreeValue(td->ctx, str);
 	JS_FreeValue(td->ctx, td->resolve);
 	JS_FreeValue(td->ctx, td->reject);
 	CloseHandle(td->thread);
-	free(td->cmd);
-	free(td->result);
-	free(td);
+	delete td;
 }
 
-char *runProcess(char *cmd)
+std::optional<std::string> runProcess(std::string& cmd)
 {
 	// Create pipes for menu
 	SECURITY_ATTRIBUTES sa = {
@@ -498,43 +459,42 @@ char *runProcess(char *cmd)
 	PROCESS_INFORMATION pi;
 	STARTUPINFO si = {
 		.cb = sizeof(STARTUPINFO),
+		.dwFlags = STARTF_USESTDHANDLES,
 		.hStdOutput = stdoutW,
 		.hStdError = stdoutW,
-		.dwFlags = STARTF_USESTDHANDLES,
 	};
-	if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+	if (!CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
 		CloseHandle(stdoutR);
 		CloseHandle(stdoutW);
-		return NULL;
+		return {};
 	}
 	CloseHandle(stdoutW);
 
 	// Read output
-	char *buf = xmalloc(4096);
-	size_t len = 0;
+	std::string output;
+	char buf[4096];
 	DWORD bread;
-	while (ReadFile(stdoutR, buf + len, 4096, &bread, NULL)) {
-		len += bread;
-		xrealloc((void**)&buf, len + 4096);
+	while (ReadFile(stdoutR, buf, 4096, &bread, NULL)) {
+		output.append(buf, buf + bread);
 	}
-	buf[len] = 0;
 
 	// Clean up
 	CloseHandle(stdoutR);
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
 
-	return buf;
+	
+	return std::make_optional<std::string>(output);
 }
 
 // The command runner for `jsShell`, ran on a different thread
 DWORD CALLBACK jsShellThread(LPVOID param)
 {
-	js_shell_thread_data_t *td = param;
-	char *res = runProcess(td->cmd);
-	if (res) {
+	js_shell_thread_data_t *td = (js_shell_thread_data_t*)param;
+	auto res = runProcess(td->cmd);
+	if (res.has_value()) {
 		td->success = true;
-		td->result = res;
+		td->result = res.value();
 	} else {
 		td->success = false;
 		td->result = strdup("failed to run command");
@@ -544,16 +504,16 @@ DWORD CALLBACK jsShellThread(LPVOID param)
 }
 
 // The "lambda" put into the Promise constructor returned from `jsShell`, ran on the main thread
-JSValue jsShellPromiseCb(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsShellPromiseCb(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	if (argc != 2 || !JS_IsFunction(ctx, argv[0]) || !JS_IsFunction(ctx, argv[1]) || !jsShellTempCmd) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
-	js_shell_thread_data_t *td = xmalloc(sizeof(js_shell_thread_data_t));
+	auto td = new js_shell_thread_data_t();
 	td->resolve = JS_DupValue(ctx, argv[0]);
 	td->reject = JS_DupValue(ctx, argv[1]);
 	td->ctx = ctx;
-	td->cmd = strdup(jsShellTempCmd);
+	td->cmd = std::string(jsShellTempCmd);
 	JS_FreeCString(ctx, jsShellTempCmd);
 	jsShellTempCmd = NULL;
 	td->thread = CreateThread(NULL, 0, jsShellThread, td, CREATE_SUSPENDED, 0);
@@ -562,7 +522,7 @@ JSValue jsShellPromiseCb(JSContext *ctx, JSValueConst this, int argc, JSValueCon
 }
 
 // Function the user calls from `$`
-JSValue jsShell(JSContext *ctx, JSValueConst this, int argc, JSValueConst *argv)
+JSValue jsShell(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
 	// TODO: make this a tag template function instead...?
 	if (argc != 1 || !JS_IsString(argv[0])) {
@@ -599,10 +559,9 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 	setvbuf(stderr, NULL, _IONBF, 0);
 
 	// Load default font
-	defaultBlock.font = xmalloc(sizeof(fontref_t));
-	defaultBlock.font->handle = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
-	defaultBlock.font->refCount = 1;
-	assert(defaultBlock.font->handle);
+	HFONT hfont = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
+	assert(hfont);
+	defaultBlock.font = std::make_shared<FontRef>(hfont);
 
 	// Create mutex
 	mainQueueMutex = CreateMutex(NULL, false, NULL);
@@ -639,16 +598,13 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 		JS_NewClass(rt, jsBlockClassId, &jsBlockClass);
 
 		JSValue proto = JS_NewObject(ctx);
-		static const JSCFunctionListEntry protoFuncs[] = {
-			JS_CFUNC_DEF("setFont", 2, jsBlockSetFont ),
-			JS_CFUNC_DEF("setText", 1, jsBlockSetText ),
-			JS_CFUNC_DEF("setColor", 3, jsBlockSetColor ),
-			JS_CFUNC_DEF("setPadding", 2, jsBlockSetPadding ),
-			JS_CFUNC_DEF("setVisible", 1, jsBlockSetVisible ),
-			JS_CFUNC_DEF("clone", 1, jsBlockClone ),
-			JS_CFUNC_DEF("remove", 0, jsBlockRemove ),
-		};
-		JS_SetPropertyFunctionList(ctx, proto, protoFuncs, 6);
+		QJS_SET_PROP_FN(ctx, proto, "setFont", jsBlockSetFont, 2);
+		QJS_SET_PROP_FN(ctx, proto, "setText", jsBlockSetText, 1);
+		QJS_SET_PROP_FN(ctx, proto, "setColor", jsBlockSetColor, 3);
+		QJS_SET_PROP_FN(ctx, proto, "setPadding", jsBlockSetPadding, 2);
+		QJS_SET_PROP_FN(ctx, proto, "setVisible", jsBlockSetVisible, 1);
+		QJS_SET_PROP_FN(ctx, proto, "clone", jsBlockClone, 1);
+		QJS_SET_PROP_FN(ctx, proto, "remove", jsBlockRemove, 0);
 		JS_SetClassProto(ctx, jsBlockClassId, proto);
 	}
 
@@ -659,15 +615,16 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 	// Add C API
 	{
 		JSValue global = JS_GetGlobalObject(ctx);
-		JS_SetPropertyStr(ctx, global, "createBlock", JS_NewCFunction(ctx, jsCreateBlock, "createBlock", 0));
+		QJS_SET_PROP_FN(ctx, global, "createBlock", jsCreateBlock, 0);
+		QJS_SET_PROP_FN(ctx, global, "$", jsShell, 1);
 		JS_SetPropertyStr(ctx, global, "defaultBlock", jsDefaultBlock);
-		JS_SetPropertyStr(ctx, global, "$", JS_NewCFunction(ctx, jsShell, "$", 1));
+
 		JSValue wbc = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, global, "__wbc", wbc);
 		JS_FreeValue(ctx, global);
 
-		JS_SetPropertyStr(ctx, wbc, "yieldToC", JS_NewCFunction(ctx, jsYieldToC, "yieldToC", 0));
-		JS_SetPropertyStr(ctx, wbc, "checkBarSize", JS_NewCFunction(ctx, jsCheckBarSize, "checkBarSize", 0));
+		QJS_SET_PROP_FN(ctx, wbc, "yieldToC", jsYieldToC, 0);
+		QJS_SET_PROP_FN(ctx, wbc, "checkBarSize", jsCheckBarSize, 0);
 	}
 
 	// Run lib (loads file)
