@@ -24,6 +24,8 @@ INCTXT(wblocksLibMJS, "src/lib.mjs");
 #include <algorithm>
 #include <optional>
 #include <queue>
+#include <thread>
+#include <mutex>
 
 #define WBLOCKS_BAR_CLASS "wblocks2_bar"
 #define WM_WBLOCKS_TRAY (WM_USER + 1)
@@ -61,7 +63,6 @@ struct Block {
 };
 
 struct {
-	bool needsUpdate;
 	HWND bar, wnd;
 	HDC screenHDC, hdc;
 	HBITMAP lastBitmap;
@@ -69,15 +70,17 @@ struct {
 	RECT barRect;
 } wb;
 
+bool blocksNeedUpdate;
 std::vector<Block*> blocks;
 Block defaultBlock;
+std::mutex blocksMutex;
 
 struct ThreadQueueTask {
 	void (*fn)(void*);
 	void *data;
 };
 std::queue<ThreadQueueTask> mainThreadQueue;
-HANDLE mainThreadQueueMutex;
+std::mutex mainThreadQueueMutex;
 
 struct js_shell_thread_data {
 	HANDLE thread;
@@ -148,20 +151,19 @@ void updateBlocks(HWND wnd)
 	UpdateLayeredWindow(wnd, wb.screenHDC, &pt, &sz, wb.hdc, &ptSrc, 0, &blendfn, ULW_ALPHA);
 }
 
-JSValue jsCheckBarSize(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
+void checkBarSize()
 {
 	if (wb.wnd) {
 		RECT cmpRect;
 		if (!GetWindowRect(wb.bar, &cmpRect)) {
 			err("failed to get tray size");
 			DestroyWindow(wb.wnd);
-			return JS_UNDEFINED;
+			return;
 		}
 		if (memcmp(&cmpRect, &wb.barRect, sizeof(RECT))) {
 			updateBlocks(wb.wnd);
 		}
 	}
-	return JS_UNDEFINED;
 }
 
 void createWindow()
@@ -280,39 +282,22 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 JSValue jsYieldToC(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
-	if (wb.wnd && wb.needsUpdate) {
-		updateBlocks(wb.wnd);
-		wb.needsUpdate = false;
-	}
-
-	WaitForSingleObject(mainThreadQueueMutex, INFINITE);
-	while (!mainThreadQueue.empty()) {
-		auto& item = mainThreadQueue.front();
-		item.fn(item.data);
-		mainThreadQueue.pop();
-	}
-	ReleaseMutex(mainThreadQueueMutex);
-
-	MSG msg;
-	while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-		TranslateMessage(&msg);
-		DispatchMessage(&msg);
-	}
 	return JS_UNDEFINED;
 }
 
 JSValue createJSBlockFromSrc(JSContext *ctx, Block *srcBlock)
 {
 	Block *block = new Block(*srcBlock);
-	wb.needsUpdate = true;
 	JSValue obj = JS_NewObjectClass(ctx, jsBlockClassId);
 	JS_SetOpaque(obj, block);
 	blocks.push_back(block);
+	blocksNeedUpdate = true;
 	return obj;
 }
 
 JSValue jsCreateBlock(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	return createJSBlockFromSrc(ctx, &defaultBlock);
 }
 
@@ -323,6 +308,7 @@ static inline Block *getBlockThis(JSValueConst thiz)
 
 JSValue jsBlockSetFont(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	// TODO: make size an optional parameter, retaining size if not given
 	if (argc != 2 || !JS_IsString(argv[0]) || !JS_IsNumber(argv[1])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
@@ -336,12 +322,13 @@ JSValue jsBlockSetFont(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst
 	auto ref = std::make_shared<FontRef>(handle);
 	auto block = getBlockThis(thiz);
 	block->font = ref;
-	wb.needsUpdate = true;
+	blocksNeedUpdate = true;
 	return JS_UNDEFINED;
 }
 
 JSValue jsBlockSetText(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	if (argc != 1 || !JS_IsString(argv[0])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
@@ -350,46 +337,50 @@ JSValue jsBlockSetText(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst
 	auto block = getBlockThis(thiz);
 	block->textLen = MultiByteToWideChar(CP_UTF8, MB_PRECOMPOSED, str, len, block->text, WBLOCKS_MAX_LEN);
 	JS_FreeCString(ctx, str);
-	wb.needsUpdate = true;
+	blocksNeedUpdate = true;
 	return JS_UNDEFINED;
 }
 
 JSValue jsBlockSetColor(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	if (argc != 3 || !JS_IsNumber(argv[0]) || !JS_IsNumber(argv[1]) || !JS_IsNumber(argv[2])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
 	getBlockThis(thiz)->color = JS_VALUE_GET_INT(argv[0])
 		| (JS_VALUE_GET_INT(argv[1]) << 8)
 		| (JS_VALUE_GET_INT(argv[2]) << 16);
-	wb.needsUpdate = true;
+	blocksNeedUpdate = true;
 	return JS_UNDEFINED;
 }
 
 JSValue jsBlockSetPadding(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	if (argc != 2 || !JS_IsNumber(argv[0]) || !JS_IsNumber(argv[1])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
 	auto block = getBlockThis(thiz);
 	block->padLeft = JS_VALUE_GET_INT(argv[0]);
 	block->padRight = JS_VALUE_GET_INT(argv[1]);
-	wb.needsUpdate = true;
+	blocksNeedUpdate = true;
 	return JS_UNDEFINED;
 }
 
 JSValue jsBlockSetVisible(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	if (argc != 1 || !JS_IsBool(argv[0])) {
 		return JS_ThrowTypeError(ctx, "Invalid argument");
 	}
 	getBlockThis(thiz)->visible = JS_VALUE_GET_BOOL(argv[0]);
-	wb.needsUpdate = true;
+	blocksNeedUpdate = true;
 	return JS_UNDEFINED;
 }
 
 JSValue jsBlockClone(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	bool keepVisibility = false;
 	if (argc >= 1) {
 		if (!JS_IsBool(argv[0])) {
@@ -406,6 +397,7 @@ JSValue jsBlockClone(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *
 
 JSValue jsBlockRemove(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 {
+	std::lock_guard<std::mutex> guard (blocksMutex);
 	auto block = getBlockThis(thiz);
 	if (block == &defaultBlock) {
 		return JS_ThrowInternalError(ctx, "Cannot remove default block");
@@ -413,7 +405,7 @@ JSValue jsBlockRemove(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst 
 		return JS_ThrowReferenceError(ctx, "Non-existent block");
 	}
 	blocks.erase(std::remove(blocks.begin(), blocks.end(), block), blocks.end());
-	wb.needsUpdate = true;
+	blocksNeedUpdate = true;
 	return JS_UNDEFINED;
 }
 
@@ -485,12 +477,12 @@ DWORD CALLBACK jsShellThread(LPVOID param)
 		td->success = false;
 		td->result = strdup("failed to run command");
 	}
-	WaitForSingleObject(mainThreadQueueMutex, INFINITE);
+	mainThreadQueueMutex.lock();
 	mainThreadQueue.emplace(ThreadQueueTask {
 		.fn = jsShellResolve,
 		.data = td,
 	});
-	ReleaseMutex(mainThreadQueueMutex);
+	mainThreadQueueMutex.unlock();
 	return 0;
 }
 
@@ -531,43 +523,8 @@ JSValue jsShell(JSContext *ctx, JSValueConst thiz, int argc, JSValueConst *argv)
 	return promise;
 }
 
-int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdShow)
+void jsThreadFn()
 {
-	hInst = inst;
-
-	// Create console and redirect output
-	assert(AllocConsole());
-#ifdef DEBUG
-	assert(freopen("CONOUT$", "w", stdout));
-	assert(freopen("CONOUT$", "w", stderr));
-#else
-	ShowWindow(GetConsoleWindow(), 0);
-	assert(freopen(WBLOCKS_LOGFILE, "w", stdout));
-	assert(freopen("NUL", "w", stderr));
-	assert(!_dup2(_fileno(stdout), _fileno(stderr)));
-#endif
-	setvbuf(stdout, NULL, _IONBF, 0);
-	setvbuf(stderr, NULL, _IONBF, 0);
-
-	// Load default font
-	HFONT hfont = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
-	assert(hfont);
-	defaultBlock.font = std::make_shared<FontRef>(hfont);
-
-	// Create mutex
-	mainThreadQueueMutex = CreateMutex(NULL, false, NULL);
-
-	// Reg class
-	WNDCLASSEX wc = {0};
-	wc.cbSize = sizeof(WNDCLASSEX);
-	wc.lpfnWndProc = wndProc;
-	wc.lpszClassName = WBLOCKS_BAR_CLASS;
-	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-	assert(RegisterClassEx(&wc));
-
-	// Create bar
-	createWindow();
-
 	// Init runtime
 	JSRuntime *rt = JS_NewRuntime();
 	assert(rt);
@@ -613,9 +570,6 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 		JSValue wbc = JS_NewObject(ctx);
 		JS_SetPropertyStr(ctx, global, "__wbc", wbc);
 		JS_FreeValue(ctx, global);
-
-		QJS_SET_PROP_FN(ctx, wbc, "yieldToC", jsYieldToC, 0);
-		QJS_SET_PROP_FN(ctx, wbc, "checkBarSize", jsCheckBarSize, 0);
 	}
 
 	// Run lib (loads file)
@@ -627,6 +581,74 @@ int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdS
 
 	// Main loop
 	js_std_loop(ctx);
+}
+
+int CALLBACK WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmdLine, int cmdShow)
+{
+	hInst = inst;
+
+	// Create console and redirect output
+	assert(AllocConsole());
+#ifdef DEBUG
+	assert(freopen("CONOUT$", "w", stdout));
+	assert(freopen("CONOUT$", "w", stderr));
+#else
+	ShowWindow(GetConsoleWindow(), 0);
+	assert(freopen(WBLOCKS_LOGFILE, "w", stdout));
+	assert(freopen("NUL", "w", stderr));
+	assert(!_dup2(_fileno(stdout), _fileno(stderr)));
+#endif
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+
+	// Load default font
+	HFONT hfont = CreateFont(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, 0, 0, "Courier New");
+	assert(hfont);
+	defaultBlock.font = std::make_shared<FontRef>(hfont);
+
+	// Reg class
+	WNDCLASSEX wc = {0};
+	wc.cbSize = sizeof(WNDCLASSEX);
+	wc.lpfnWndProc = wndProc;
+	wc.lpszClassName = WBLOCKS_BAR_CLASS;
+	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+	assert(RegisterClassEx(&wc));
+
+	// Create bar
+	createWindow();
+
+	// Create JS state
+	auto jsThread = std::thread(jsThreadFn);
+
+	// Main loop
+	while (true) {
+		checkBarSize(); // TODO: timer instead
+
+		blocksMutex.lock();
+		if (wb.wnd && blocksNeedUpdate) {
+			updateBlocks(wb.wnd);
+			blocksNeedUpdate = false; // TODO: window message instead
+		}
+		blocksMutex.unlock();
+
+		mainThreadQueueMutex.lock(); // TODO: window message instead
+		while (!mainThreadQueue.empty()) {
+			auto& item = mainThreadQueue.front();
+			item.fn(item.data);
+			mainThreadQueue.pop();
+		}
+		mainThreadQueueMutex.unlock();
+
+		MSG msg;
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+
+		Sleep(10);
+	}
+
+	jsThread.join();
 
 	return 0;
 }

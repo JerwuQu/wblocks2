@@ -45,9 +45,6 @@ globalThis.$psFetch = async url => {
 	return await globalThis.$ps(cmd);
 };
 
-setInterval(__wbc.yieldToC, 10);
-setInterval(__wbc.checkBarSize, 100);
-
 // TODO: colored info, warn, error
 console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
 
