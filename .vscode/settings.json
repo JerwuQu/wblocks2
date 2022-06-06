@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "vector": "cpp",
+        "*.tcc": "cpp",
+        "optional": "cpp"
+    }
+}

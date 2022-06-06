@@ -12,6 +12,8 @@ globalThis.setInterval = (fn, interval) => {
 };
 // TODO: clearInterval
 
+setInterval(__wbc.yieldToC, 10);
+
 globalThis.$quote = arg => {
 	// Sources:
 	// - https://stackoverflow.com/a/47469792
@@ -44,9 +46,6 @@ globalThis.$psFetch = async url => {
 	const cmd = `$ProgressPreference='SilentlyContinue';$(Invoke-WebRequest '${url.replace(/'/g, "''")}').Content`;
 	return await globalThis.$ps(cmd);
 };
-
-setInterval(__wbc.yieldToC, 10);
-setInterval(__wbc.checkBarSize, 100);
 
 // TODO: colored info, warn, error
 console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
