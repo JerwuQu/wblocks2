@@ -8,9 +8,9 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v1
     - name: Install deps
-      run: sudo apt install gcc-mingw-w64-x86-64
+      run: sudo apt install g++-mingw-w64-x86-64
     - name: Build
-      run: CC=x86_64-w64-mingw32-gcc make
+      run: make
     - name: Upload artifact
       uses: actions/upload-artifact@master
       with:
