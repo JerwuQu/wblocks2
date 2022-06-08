@@ -13,9 +13,8 @@ jobs:
         sudo add-apt-repository "deb http://archive.ubuntu.com/ubuntu kinetic universe"
         sudo apt update
         sudo apt install g++-mingw-w64-x86-64
+        sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
         x86_64-w64-mingw32-g++ -v
-        
-        sudo update-alternatives --config x86_64-w64-mingw32-g++
     - name: Build
       run: make
     - name: Upload artifact
