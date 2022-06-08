@@ -12,7 +12,7 @@ jobs:
         sudo apt install software-properties-common
         sudo add-apt-repository "deb http://archive.ubuntu.com/ubuntu kinetic universe"
         sudo apt update
-        sudo apt install g++-mingw-w64-x86-64
+        sudo apt install g++-mingw-w64-x86-64 g++-mingw-w64-x86-64-posix
     - name: Build
       run: make
     - name: Upload artifact
