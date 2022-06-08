@@ -3,7 +3,7 @@ on: [push]
 jobs:
   build:
     name: Ubuntu->Windows Cross Compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
     - name: Checkout repo
       uses: actions/checkout@v1
