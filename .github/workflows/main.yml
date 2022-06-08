@@ -8,7 +8,11 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v1
     - name: Install deps
-      run: sudo apt install g++-mingw-w64-x86-64
+      run: |
+        sudo apt install software-properties-common
+        sudo add-apt-repository "deb http://archive.ubuntu.com/ubuntu kinetic universe"
+        sudo apt update
+        sudo apt install g++-mingw-w64-x86-64
     - name: Build
       run: make
     - name: Upload artifact
