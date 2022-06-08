@@ -5,7 +5,7 @@ DEP=$(wildcard src/*) quickjs
 .PHONY: clean clean-all run
 
 $(PROJ).exe: $(SRC) $(DEP) wblocks.res
-	x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wl,-subsystem,windows -Iquickjs/include -Lquickjs/lib/quickjs -o $@ $(SRC) wblocks.res -static -lstdc++ -lgdi32 -lquickjs -pthread
+	x86_64-w64-mingw32-g++ -std=c++20 -O2 -Wall -Wl,-subsystem,windows -Iquickjs/include -Lquickjs/lib/quickjs -o $@ $(SRC) wblocks.res -static -lstdc++ -lgdi32 -lquickjs -pthread
 
 wblocks.res:
 	x86_64-w64-mingw32-windres wblocks.rc -O coff -o wblocks.res
