@@ -1,26 +1,54 @@
 const std = @import("std");
 const C = @cImport({
     @cInclude("quickjs/quickjs.h");
+    @cInclude("quickjs/quickjs-libc.h");
 });
 
-fn initJS() !void {
-    std.log.debug("JS init", .{});
+const JS = struct {
+    rt: *C.JSRuntime,
+    ctx: *C.JSContext,
 
-    const rt = C.JS_NewRuntime();
-    if (rt == null) {
-        return error.QuickJSInitFailure;
+    fn init() !JS {
+        const rt = C.JS_NewRuntime() orelse return error.QuickJSInitFailure;
+        errdefer C.JS_FreeRuntime(rt);
+
+        const ctx = C.JS_NewContext(rt) orelse return error.QuickJSInitFailure;
+        errdefer C.JS_FreeContext(ctx);
+
+        _ = C.js_init_module_std(ctx, "std");
+        _ = C.js_init_module_os(ctx, "os");
+        C.js_std_add_helpers(ctx, 0, null);
+
+        return .{
+            .rt = rt,
+            .ctx = ctx,
+        };
     }
-    errdefer C.JS_FreeRuntime(rt);
-
-    const ctx = C.JS_NewContext(rt);
-    if (ctx == null) {
-        return error.QuickJSInitFailure;
+    fn deinit(self: *JS) void {
+        C.JS_FreeContext(self.ctx);
+        C.JS_FreeRuntime(self.rt);
     }
-    errdefer C.JS_FreeContext(ctx);
+    fn eval(self: *JS, str: []const u8) !void {
+        // TODO: make sure there's a null-terminator
+        var retval = C.JS_Eval(self.ctx, str.ptr, str.len, "<eval>", C.JS_EVAL_TYPE_GLOBAL);
+        defer C.JS_FreeValue(self.ctx, retval);
+        try self.checkJSValue(retval);
+    }
 
-    std.log.debug("JS init OK", .{});
-}
+    fn checkJSValue(self: *JS, jsv: C.JSValue) !void {
+        if (C.JS_IsException(jsv) != 0) {
+            var exval = C.JS_GetException(self.ctx);
+            defer C.JS_FreeValue(self.ctx, exval);
+            var str = C.JS_ToCString(self.ctx, exval);
+            defer C.JS_FreeCString(self.ctx, str);
+            std.log.err("JS Exception: {s}", .{str});
+            return error.JSException;
+        }
+    }
+};
 
 pub fn main() !void {
-    try initJS();
+    var js = try JS.init();
+    defer js.deinit();
+    try js.eval("console.log('Hello from JS')");
 }

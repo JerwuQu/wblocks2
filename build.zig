@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath("third_party");
     exe.addCSourceFiles(&[_][]const u8{
         "third_party/quickjs/quickjs.c",
+        "third_party/quickjs/quickjs-libc.c",
         "third_party/quickjs/cutils.c",
         "third_party/quickjs/libregexp.c",
         "third_party/quickjs/libbf.c",
