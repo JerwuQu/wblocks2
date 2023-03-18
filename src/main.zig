@@ -102,8 +102,9 @@ const Block = struct {
         self.wtext.shrinkRetainingCapacity(gpalloc, len);
     }
     fn setFont(self: *Block, name: []const u8, size: isize) !void {
+        const new = try FontRef.create(name, size);
         self.font.unRef();
-        self.font = try FontRef.create(name, size);
+        self.font = new;
     }
 };
 
@@ -120,11 +121,14 @@ const Bar = struct {
     const TRAY_MENU_RELOAD = 2;
     const TRAY_MENU_EXIT = 3;
 
-    wnd: ?winfon.HWND = null,
+    var trayIcon: winwin.HICON = undefined;
+
     taskbar: winfon.HWND,
-    screenDC: wingdi.HDC,
-    barDC: wingdi.HDC,
-    trayIcon: winwin.HICON,
+
+    // Set once window has been created
+    wnd: ?winfon.HWND = null,
+    screenDC: wingdi.HDC = undefined,
+    barDC: wingdi.HDC = undefined,
 
     fn init() !void {
         // Reg class
@@ -136,6 +140,15 @@ const Bar = struct {
         if (winwin.RegisterClassExA(&wc) == 0) {
             return error.RegisterClassFailed;
         }
+
+        // Alloc resources
+        // TODO: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createicon
+        trayIcon = winwin.LoadIcon(null, winwin.IDI_APPLICATION) orelse return error.LoadIconFailed;
+        errdefer _ = winwin.DestroyIcon(trayIcon);
+    }
+    fn deinit() void {
+        _ = winwin.UnregisterClassA(CLASS, null);
+        _ = winwin.DestroyIcon(trayIcon);
     }
     fn create() !*Bar {
         const tray = winwin.FindWindowA("Shell_TrayWnd", null) orelse return error.TaskBarNotFound;
@@ -144,16 +157,7 @@ const Bar = struct {
         var self = try gpalloc.create(Bar);
         errdefer gpalloc.destroy(self);
 
-        const screenDC = wingdi.GetDC(null) orelse return error.DCCreationFailed;
-        errdefer _ = wingdi.ReleaseDC(null, screenDC);
-        const barDC = wingdi.CreateCompatibleDC(screenDC);
-        errdefer _ = wingdi.DeleteDC(barDC);
-
-        // TODO: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createicon
-        const trayIcon = winwin.LoadIcon(null, winwin.IDI_APPLICATION) orelse return error.LoadIconFailed;
-        errdefer _ = winwin.DestroyIcon(trayIcon);
-
-        self.* = .{ .taskbar = taskbar, .screenDC = screenDC, .barDC = barDC, .trayIcon = trayIcon };
+        self.* = .{ .taskbar = taskbar };
         self.wnd = winwin.CreateWindowExA(.LAYERED, CLASS, TITLE, .OVERLAPPED, 0, 0, 0, 0, taskbar, null, null, self) orelse return error.BarCreationFailed;
         return self;
     }
@@ -163,36 +167,42 @@ const Bar = struct {
         _ = winwin.SetWindowLongPtrA(self.wnd, winwin.GWLP_USERDATA, @bitCast(isize, @ptrToInt(self)));
         _ = winwin.SetParent(self.wnd, self.taskbar);
 
+        // Alloc resources
+        self.screenDC = wingdi.GetDC(null) orelse @panic("GetDC failed");
+        self.barDC = wingdi.CreateCompatibleDC(self.screenDC);
+
         // Create tray icon
         var notifData = std.mem.zeroes(winshl.NOTIFYICONDATAA);
         notifData.cbSize = @sizeOf(@TypeOf(notifData));
         notifData.hWnd = wnd;
         notifData.uFlags = @intToEnum(win32.ui.shell.NOTIFY_ICON_DATA_FLAGS, @enumToInt(winshl.NIF_MESSAGE) | @enumToInt(winshl.NIF_ICON) | @enumToInt(winshl.NIF_TIP));
         notifData.uCallbackMessage = WM_WBLOCKS_TRAY;
-        notifData.hIcon = self.trayIcon;
+        notifData.hIcon = trayIcon;
         std.mem.copy(u8, &notifData.szTip, "wblocks\x00");
         _ = winshl.Shell_NotifyIconA(.ADD, &notifData);
     }
     fn destroy(self: *Bar) void {
+        if (self.wnd == null) {
+            return;
+        }
+
         _ = wingdi.DeleteDC(self.barDC);
         _ = wingdi.ReleaseDC(null, self.screenDC);
 
-        if (self.wnd != null) {
-            var notifData = std.mem.zeroes(winshl.NOTIFYICONDATAA);
-            notifData.cbSize = @sizeOf(@TypeOf(notifData));
-            notifData.hWnd = self.wnd;
-            _ = winshl.Shell_NotifyIconA(.DELETE, &notifData);
+        var notifData = std.mem.zeroes(winshl.NOTIFYICONDATAA);
+        notifData.cbSize = @sizeOf(@TypeOf(notifData));
+        notifData.hWnd = self.wnd;
+        _ = winshl.Shell_NotifyIconA(.DELETE, &notifData);
 
-            _ = winwin.DestroyWindow(self.wnd.?);
-        }
+        _ = winwin.SetWindowLongPtrA(self.wnd, winwin.GWLP_USERDATA, 0); // Prevent accessing *Bar later
+        _ = winwin.DestroyWindow(self.wnd.?);
+        self.wnd = null;
 
         gpalloc.destroy(self);
     }
-
     fn fromWnd(wnd: winfon.HWND) !*Bar {
         const value = winwin.GetWindowLongPtrA(wnd, winwin.GWLP_USERDATA);
         if (value == 0) {
-            std.log.err("Missing *Bar reference on window", .{});
             return error.NoBarWindow;
         }
         return @intToPtr(*Bar, @bitCast(usize, value));
@@ -201,16 +211,19 @@ const Bar = struct {
         switch (msg) {
             winwin.WM_NCCREATE => {
                 var createData = @intToPtr(*winwin.CREATESTRUCTA, @bitCast(usize, lParam));
-                std.log.debug("{}", .{createData.cx});
                 var bar = @ptrCast(*Bar, @alignCast(@alignOf(*Bar), createData.lpCreateParams));
                 bar.initWindow(wnd);
             },
             winwin.WM_NCDESTROY => blk: {
                 var bar = fromWnd(wnd) catch break :blk;
-                _ = bar; // TODO
+                std.log.warn("wblocks window died, probably due to explorer.exe crashing", .{});
+                bar.destroy();
             },
             WM_WBLOCKS_TRAY => blk: {
-                var bar = fromWnd(wnd) catch break :blk;
+                var bar = fromWnd(wnd) catch {
+                    std.log.err("Missing *Bar reference on window", .{});
+                    break :blk;
+                };
                 if ((lParam & 0xffff) == winwin.WM_LBUTTONUP or (lParam & 0xffff) == winwin.WM_RBUTTONUP) {
                     var pt: winfon.POINT = undefined;
                     _ = winwin.GetCursorPos(&pt);
@@ -306,6 +319,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     try Bar.init();
+    defer Bar.deinit();
     var bar = try Bar.create();
     defer bar.destroy();
 
