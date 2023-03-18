@@ -1,0 +1,6 @@
+[submodule "zigwin32"]
+	path = third_party/zigwin32
+	url = https://github.com/marlersoft/zigwin32.git
+[submodule "third_party/quickjs"]
+	path = third_party/quickjs
+	url = https://github.com/bellard/quickjs.git

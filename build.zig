@@ -9,12 +9,16 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
+    const zigwin32 = b.createModule(.{ .source_file = .{ .path = "third_party/zigwin32/win32.zig" } });
+
     const exe = b.addExecutable(.{
         .name = "wblocks",
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
+    exe.addModule("win32", zigwin32);
+
     exe.linkLibC();
 
     // Manually link pthread since zig doesn't ship with it
@@ -23,7 +27,7 @@ pub fn build(b: *std.Build) void {
     exe.addObjectFile("third_party/mingw64/lib/libpthread.a");
 
     // QuickJS
-    exe.addIncludePath("third_party");
+    exe.addIncludePath("third_party/quickjs");
     exe.addCSourceFiles(&[_][]const u8{
         "third_party/quickjs/quickjs.c",
         "third_party/quickjs/quickjs-libc.c",
