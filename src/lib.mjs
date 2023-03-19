@@ -51,7 +51,7 @@ console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
 
 console.log("Hello from lib.mjs!");
 const block = wb.createBlock();
-block.setText('Hello');
+block.setText('Hello everyonnneeeeeeeeeee');
 console.log(block);
 
 // Load all scripts within the `blocks` dir

@@ -1,10 +1,10 @@
 const std = @import("std");
 
-const win32 = @import("win32");
-const wingdi = win32.graphics.gdi;
-const winfon = win32.foundation;
-const winwin = win32.ui.windows_and_messaging;
-const winshl = win32.ui.shell;
+const C = @cImport({
+    @cDefine("UNICODE", "1");
+    @cInclude("windows.h");
+    @cInclude("gdiplus/gdiplus.h");
+});
 
 const qjs = @import("./qjs.zig");
 const QJSC = qjs.C;
@@ -12,33 +12,31 @@ const QJS = qjs.QJS;
 
 var gpalloc: std.mem.Allocator = undefined;
 
+fn gpAssert(comptime src: std.builtin.SourceLocation, status: C.GpStatus) void {
+    if (status != 0) {
+        std.log.err("GDI+ error: {d} ({s}@{s}:{d})", .{ status, src.fn_name, src.file, src.line });
+        std.os.exit(1);
+    }
+}
+
 const FontRef = struct {
-    handle: wingdi.HFONT,
+    handle: *C.GpFont,
     refs: usize,
 
     // Create and add reference
     fn create(name: []const u8, size: isize) !*FontRef {
         const wname = try std.unicode.utf8ToUtf16LeWithNull(gpalloc, name);
         defer gpalloc.free(wname);
-        const handle = wingdi.CreateFont(
-            @intCast(i32, size),
-            0,
-            0,
-            0,
-            wingdi.FW_NORMAL,
-            0,
-            0,
-            0,
-            0,
-            .DEFAULT_PRECIS,
-            .DEFAULT_PRECIS,
-            .DEFAULT_QUALITY,
-            .DONTCARE,
-            wname.ptr,
-        ) orelse return error.CreateFontFailed;
+
+        // TODO
+        var ff: ?*C.GpFontFamily = null;
+        gpAssert(@src(), C.GdipGetGenericFontFamilySansSerif(&ff));
+        var handle: ?*C.GpFont = null;
+        gpAssert(@src(), C.GdipCreateFont(ff, @intToFloat(f32, size), C.FontStyleRegular, C.UnitPixel, &handle));
+
         var self = try gpalloc.create(FontRef);
         self.* = .{
-            .handle = handle,
+            .handle = handle.?,
             .refs = 1,
         };
         return self;
@@ -49,7 +47,7 @@ const FontRef = struct {
     fn unRef(self: *FontRef) void {
         self.refs -= 1;
         if (self.refs == 0) {
-            _ = wingdi.DeleteObject(self.handle);
+            // TODO _ = C.DeleteObject(self.handle);
             gpalloc.destroy(self);
         }
     }
@@ -62,17 +60,18 @@ const Block = struct {
     font: *FontRef,
 
     visible: bool = true,
-    color: u32 = 0x00ffffff, // https://learn.microsoft.com/en-us/windows/win32/gdi/colorref
     padLeft: i32 = 5,
     padRight: i32 = 5,
+    brush: ?*C.GpSolidFill = null,
 
     fn getDefault() !*Block {
         if (default == null) {
             default = try gpalloc.create(Block);
             default.?.* = .{
                 .wtext = try std.unicode.utf8ToUtf16LeWithNull(gpalloc, ""),
-                .font = try FontRef.create("Arial", 24),
+                .font = try FontRef.create("Arial", 40),
             };
+            gpAssert(@src(), C.GdipCreateSolidFill(0xffffffff, &default.?.brush));
         }
         return default.?;
     }
@@ -148,7 +147,7 @@ const BarManager = struct {
     fn jsEndUpdate(self: *BarManager) void {
         self.mutex.unlock();
         if (self.bar.wnd) |wnd| {
-            _ = winwin.PostMessage(wnd, BarWindow.WM_WBLOCKS_UPDATE, 0, 0);
+            _ = C.PostMessageA(wnd, BarWindow.WM_WBLOCKS_UPDATE, 0, 0);
         }
     }
 };
@@ -156,144 +155,146 @@ const BarManager = struct {
 const BarWindow = struct {
     const TITLE = "wblocks bar";
     const CLASS = "WBLOCKS_BAR_CLASS";
-    const WM_WBLOCKS_UPDATE = winwin.WM_USER + 1;
-    const WM_WBLOCKS_TRAY = winwin.WM_USER + 2;
+    const WM_WBLOCKS_UPDATE = C.WM_USER + 1;
+    const WM_WBLOCKS_TRAY = C.WM_USER + 2;
     const TRAY_MENU_SHOW_LOG = 1;
     const TRAY_MENU_RELOAD = 2;
     const TRAY_MENU_EXIT = 3;
 
-    var trayIcon: winwin.HICON = undefined;
+    var trayIcon: C.HICON = undefined;
 
     manager: *BarManager,
 
-    taskbarWnd: winfon.HWND,
-    trayWnd: winfon.HWND,
-    drawSize: winfon.SIZE = std.mem.zeroes(winfon.SIZE),
+    taskbarWnd: C.HWND,
+    trayWnd: C.HWND,
+    drawSize: C.SIZE = std.mem.zeroes(C.SIZE),
 
     // Set once window has been created
-    wnd: ?winfon.HWND = null,
-    barBitmap: ?wingdi.HBITMAP = null,
-    screenDC: wingdi.HDC = undefined,
-    barDC: wingdi.HDC = undefined,
+    wnd: ?C.HWND = null,
+    barBitmap: ?C.HBITMAP = null,
+    pvBits: [*c]u8 = null,
+    screenDC: C.HDC = undefined,
+    barDC: C.HDC = undefined,
+    gfx: ?*C.GpGraphics = undefined,
 
     fn init() !void {
         // Reg class
-        var wc = std.mem.zeroes(winwin.WNDCLASSEXA);
+        var wc = std.mem.zeroes(C.WNDCLASSEXA);
         wc.cbSize = @sizeOf(@TypeOf(wc));
         wc.lpfnWndProc = wndProc;
         wc.lpszClassName = CLASS;
-        wc.hCursor = winwin.LoadCursor(null, winwin.IDC_ARROW);
-        if (winwin.RegisterClassExA(&wc) == 0) {
+        wc.hCursor = C.LoadCursorA(null, C.MAKEINTRESOURCEA(32512)); // IDC_ARROW
+        if (C.RegisterClassExA(&wc) == 0) {
             return error.RegisterClassFailed;
         }
 
         // Alloc resources
         // TODO: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createicon
-        trayIcon = winwin.LoadIcon(null, winwin.IDI_APPLICATION) orelse return error.LoadIconFailed;
-        errdefer _ = winwin.DestroyIcon(trayIcon);
+        trayIcon = C.LoadIconA(null, C.MAKEINTRESOURCEA(32512)) orelse return error.LoadIconFailed; // IDI_APPLICATION
+        errdefer _ = C.DestroyIconA(trayIcon);
     }
     fn deinit() void {
-        _ = winwin.UnregisterClassA(CLASS, null);
-        _ = winwin.DestroyIcon(trayIcon);
+        _ = C.UnregisterClassA(CLASS, null);
+        _ = C.DestroyIcon(trayIcon);
     }
 
     fn create(manager: *BarManager) !*BarWindow {
-        const taskbarWnd = winwin.FindWindowA("Shell_TrayWnd", null) orelse return error.TaskBarNotFound;
-        const trayWnd = winwin.FindWindowExA(taskbarWnd, null, "TrayNotifyWnd", null) orelse return error.TaskBarNotFound;
+        const taskbarWnd = C.FindWindowA("Shell_TrayWnd", null) orelse return error.TaskBarNotFound;
+        const trayWnd = C.FindWindowExA(taskbarWnd, null, "TrayNotifyWnd", null) orelse return error.TaskBarNotFound;
 
         var self = try gpalloc.create(BarWindow);
         errdefer gpalloc.destroy(self);
 
         self.* = .{ .manager = manager, .taskbarWnd = taskbarWnd, .trayWnd = trayWnd };
-        self.wnd = winwin.CreateWindowExA(.LAYERED, CLASS, TITLE, .OVERLAPPED, 0, 0, 0, 0, taskbarWnd, null, null, self) orelse return error.BarCreationFailed;
+        const wexstyle = 0x00080000 | 0x00000020; // translate-c bug (C.WS_EX_LAYERED | C.WS_EX_TRANSPARENT)
+        const wstyle = @as(c_longlong, 0x80000000) & ~@as(c_longlong, 0x00800000); // translate-c bug (C.WS_POPUP & ~C.WS_BORDER)
+        self.wnd = C.CreateWindowExA(wexstyle, CLASS, TITLE, wstyle, 0, 0, 0, 0, taskbarWnd, null, null, self) orelse return error.BarCreationFailed;
         return self;
     }
-    fn initWindow(self: *BarWindow, wnd: winfon.HWND) void {
+    fn initWindow(self: *BarWindow, wnd: C.HWND) void {
         // Set up *Bar reference
         self.wnd = wnd;
-        _ = winwin.SetWindowLongPtrA(self.wnd, winwin.GWLP_USERDATA, @bitCast(isize, @ptrToInt(self)));
-        _ = winwin.SetParent(self.wnd, self.taskbarWnd);
+        _ = C.SetWindowLongPtrA(self.wnd.?, C.GWLP_USERDATA, @bitCast(isize, @ptrToInt(self)));
+        _ = C.SetParent(self.wnd.?, self.taskbarWnd);
 
         // Alloc resources
-        self.screenDC = wingdi.GetDC(null) orelse @panic("GetDC failed");
-        self.barDC = wingdi.CreateCompatibleDC(self.screenDC);
+        self.screenDC = C.GetDC(null) orelse @panic("GetDC failed");
+        self.barDC = C.CreateCompatibleDC(self.screenDC);
+        gpAssert(@src(), C.GdipCreateFromHDC(self.barDC, &self.gfx));
 
         // Create tray icon
-        var notifData = std.mem.zeroes(winshl.NOTIFYICONDATAA);
+        var notifData = std.mem.zeroes(C.NOTIFYICONDATAA);
         notifData.cbSize = @sizeOf(@TypeOf(notifData));
-        notifData.hWnd = wnd;
-        notifData.uFlags = @intToEnum(win32.ui.shell.NOTIFY_ICON_DATA_FLAGS, @enumToInt(winshl.NIF_MESSAGE) | @enumToInt(winshl.NIF_ICON) | @enumToInt(winshl.NIF_TIP));
+        notifData.hWnd = wnd.?;
+        notifData.uFlags = C.NIF_MESSAGE | C.NIF_ICON | C.NIF_TIP;
         notifData.uCallbackMessage = WM_WBLOCKS_TRAY;
         notifData.hIcon = trayIcon;
         std.mem.copy(u8, &notifData.szTip, "wblocks\x00");
-        _ = winshl.Shell_NotifyIconA(.ADD, &notifData);
+        _ = C.Shell_NotifyIconA(C.NIM_ADD, &notifData);
 
-        // Update
+        // Show and update
+        _ = C.ShowWindow(wnd, C.SW_SHOW);
         self.update() catch |err| {
             std.log.err("Failed to update bar on creation: {}, exiting", .{err});
             std.os.exit(1);
         };
     }
     fn destroy(self: *BarWindow) void {
-        if (self.wnd == null) {
-            return;
+        if (self.wnd) |wnd| {
+            _ = C.DeleteDC(self.barDC);
+            _ = C.ReleaseDC(null, self.screenDC);
+
+            var notifData = std.mem.zeroes(C.NOTIFYICONDATAA);
+            notifData.cbSize = @sizeOf(@TypeOf(notifData));
+            notifData.hWnd = wnd;
+            _ = C.Shell_NotifyIconA(C.NIM_DELETE, &notifData);
+
+            _ = C.SetWindowLongPtrA(wnd, C.GWLP_USERDATA, 0); // Prevent accessing *Bar later
+            _ = C.DestroyWindow(wnd);
+            self.wnd = null;
+
+            gpalloc.destroy(self);
         }
-
-        _ = wingdi.DeleteDC(self.barDC);
-        _ = wingdi.ReleaseDC(null, self.screenDC);
-
-        var notifData = std.mem.zeroes(winshl.NOTIFYICONDATAA);
-        notifData.cbSize = @sizeOf(@TypeOf(notifData));
-        notifData.hWnd = self.wnd;
-        _ = winshl.Shell_NotifyIconA(.DELETE, &notifData);
-
-        _ = winwin.SetWindowLongPtrA(self.wnd, winwin.GWLP_USERDATA, 0); // Prevent accessing *Bar later
-        _ = winwin.DestroyWindow(self.wnd.?);
-        self.wnd = null;
-
-        gpalloc.destroy(self);
     }
-    fn fromWnd(wnd: winfon.HWND) !*BarWindow {
-        const value = winwin.GetWindowLongPtrA(wnd, winwin.GWLP_USERDATA);
+    fn fromWnd(wnd: C.HWND) !*BarWindow {
+        const value = C.GetWindowLongPtrA(wnd, C.GWLP_USERDATA);
         if (value == 0) {
             return error.NoBarWindow;
         }
         return @intToPtr(*BarWindow, @bitCast(usize, value));
     }
-    fn wndProc(wnd: winfon.HWND, msg: u32, wParam: usize, lParam: isize) callconv(.C) isize {
+    fn wndProc(wnd: C.HWND, msg: u32, wParam: usize, lParam: isize) callconv(.C) isize {
         switch (msg) {
-            winwin.WM_CREATE => {
-                var createData = @intToPtr(*winwin.CREATESTRUCTA, @bitCast(usize, lParam));
+            C.WM_CREATE => {
+                var createData = @intToPtr(*C.CREATESTRUCTA, @bitCast(usize, lParam));
                 var bar = @ptrCast(*BarWindow, @alignCast(@alignOf(*BarWindow), createData.lpCreateParams));
                 bar.initWindow(wnd);
             },
-            winwin.WM_NCDESTROY => blk: {
+            C.WM_NCDESTROY => blk: {
                 var bar = fromWnd(wnd) catch break :blk;
                 std.log.warn("wblocks BarWindow died, probably due to explorer.exe crashing", .{});
                 bar.manager.recreateBar();
                 return 0;
             },
+            C.WM_PAINT => std.log.debug("Paint?", .{}),
             WM_WBLOCKS_TRAY => blk: {
                 var bar = fromWnd(wnd) catch {
                     std.log.err("Missing *BarWindow reference on window", .{});
                     break :blk;
                 };
-                if ((lParam & 0xffff) == winwin.WM_LBUTTONUP or (lParam & 0xffff) == winwin.WM_RBUTTONUP) {
-                    var pt: winfon.POINT = undefined;
-                    _ = winwin.GetCursorPos(&pt);
-                    var hmenu: winwin.HMENU = winwin.CreatePopupMenu() orelse break :blk;
-                    const itemFlags = @intToEnum(winwin.MENU_ITEM_FLAGS, @enumToInt(winwin.MF_BYPOSITION) | @enumToInt(winwin.MF_STRING));
-                    _ = winwin.InsertMenuA(hmenu, 0, itemFlags, TRAY_MENU_SHOW_LOG, "Show Log");
-                    _ = winwin.InsertMenuA(hmenu, 1, itemFlags, TRAY_MENU_RELOAD, "Reload");
-                    _ = winwin.InsertMenuA(hmenu, 2, itemFlags, TRAY_MENU_EXIT, "Exit");
-                    _ = winwin.SetForegroundWindow(wnd);
-                    const cmd = winwin.TrackPopupMenu(hmenu, winwin.TRACK_POPUP_MENU_FLAGS.initFlags(.{
-                        .LEFTBUTTON = 1,
-                        .BOTTOMALIGN = 1,
-                        .NONOTIFY = 1,
-                        .RETURNCMD = 1,
-                    }), pt.x, pt.y, 0, wnd, null);
-                    _ = winwin.PostMessage(wnd, 0, 0, 0);
+                _ = bar;
+                if ((lParam & 0xffff) == C.WM_LBUTTONUP or (lParam & 0xffff) == C.WM_RBUTTONUP) {
+                    var pt: C.POINT = undefined;
+                    _ = C.GetCursorPos(&pt);
+                    var hmenu: C.HMENU = C.CreatePopupMenu() orelse break :blk;
+                    const MF_BYPOSITION = 0x00000400; // NOTE: translate-c bug
+                    _ = C.InsertMenuA(hmenu, 0, MF_BYPOSITION, TRAY_MENU_SHOW_LOG, "Show Log");
+                    _ = C.InsertMenuA(hmenu, 1, MF_BYPOSITION, TRAY_MENU_RELOAD, "Reload");
+                    _ = C.InsertMenuA(hmenu, 2, MF_BYPOSITION, TRAY_MENU_EXIT, "Exit");
+                    _ = C.SetForegroundWindow(wnd);
+                    const tpmFlags = 0x0020 | 0x0080 | 0x0100; // translate-c bug (C.TPM_BOTTOMALIGN | C.TPM_NONOTIFY | C.TPM_RETURNCMD)
+                    const cmd = C.TrackPopupMenu(hmenu, tpmFlags, pt.x, pt.y, 0, wnd, null);
+                    _ = C.PostMessageA(wnd, 0, 0, 0);
 
                     if (cmd == TRAY_MENU_SHOW_LOG) {
                         // TODO
@@ -301,7 +302,6 @@ const BarWindow = struct {
                         // TODO
                     } else if (cmd == TRAY_MENU_EXIT) {
                         // TODO: bar.manager.deinit();
-                        _ = bar;
                         std.os.exit(0);
                     }
                 }
@@ -318,19 +318,19 @@ const BarWindow = struct {
             },
             else => {},
         }
-        return winwin.DefWindowProc(wnd, msg, wParam, lParam);
+        return C.DefWindowProcA(wnd, msg, wParam, lParam);
     }
 
-    fn getSupposedSize(self: *BarWindow) !winfon.SIZE {
-        var taskbarRect: winfon.RECT = undefined;
-        if (winwin.GetWindowRect(self.taskbarWnd, &taskbarRect) == 0) {
+    fn getSupposedSize(self: *BarWindow) !C.SIZE {
+        var taskbarRect: C.RECT = undefined;
+        if (C.GetWindowRect(self.taskbarWnd, &taskbarRect) == 0) {
             return error.TaskBarSizeError;
         }
-        var trayRect: winfon.RECT = undefined;
-        if (winwin.GetWindowRect(self.trayWnd, &trayRect) == 0) {
+        var trayRect: C.RECT = undefined;
+        if (C.GetWindowRect(self.trayWnd, &trayRect) == 0) {
             return error.TaskBarSizeError;
         }
-        return winfon.SIZE{
+        return C.SIZE{
             .cx = (taskbarRect.right - taskbarRect.left) - (trayRect.right - trayRect.left),
             .cy = taskbarRect.bottom - taskbarRect.top,
         };
@@ -345,7 +345,7 @@ const BarWindow = struct {
     }
     // On error, recreate window
     fn update(self: *BarWindow) !void {
-        var pt = winfon.POINT{ .x = 0, .y = 0 };
+        var pt = C.POINT{ .x = 0, .y = 0 };
         var sz = try self.getSupposedSize();
         std.log.debug("Pt: {},{} - Sz: {},{}", .{ pt.x, pt.y, sz.cx, sz.cy });
 
@@ -354,10 +354,10 @@ const BarWindow = struct {
             std.log.debug("Creating bitmap", .{});
             self.drawSize = sz;
             if (self.barBitmap) |bm| {
-                _ = wingdi.DeleteObject(bm);
+                _ = C.DeleteObject(bm);
             }
-            self.barBitmap = wingdi.CreateCompatibleBitmap(self.screenDC, sz.cx, sz.cy);
-            _ = wingdi.SelectObject(self.barDC, self.barBitmap);
+            self.barBitmap = C.CreateCompatibleBitmap(self.screenDC, sz.cx, sz.cy);
+            _ = C.SelectObject(self.barDC, self.barBitmap.?);
         }
 
         // Draw blocks
@@ -365,34 +365,34 @@ const BarWindow = struct {
             std.log.debug("Drawing blocks", .{});
             self.manager.mutex.lock();
             defer self.manager.mutex.unlock();
-            var rect = winfon.RECT{ .left = 0, .top = 0, .right = sz.cx, .bottom = sz.cy };
-            _ = wingdi.SetBkMode(self.barDC, .TRANSPARENT);
+            var rect = C.RectF{ .X = 1000, .Y = 0, .Width = @intToFloat(f32, sz.cx), .Height = @intToFloat(f32, sz.cy) + 100 };
             for (self.manager.blocks.items) |block| {
                 if (block.visible) {
-                    rect.right -= block.padRight;
-                    _ = wingdi.SetTextColor(self.barDC, block.color);
-                    _ = wingdi.SelectObject(self.barDC, block.font.handle);
-                    const DTF = wingdi.DRAW_TEXT_FORMAT;
-                    const drawFlags = @intToEnum(DTF, @enumToInt(DTF.NOCLIP) | @enumToInt(DTF.NOPREFIX) |
-                        @enumToInt(DTF.SINGLELINE) | @enumToInt(DTF.RIGHT) | @enumToInt(DTF.VCENTER));
-                    const calcFlags = @intToEnum(DTF, @enumToInt(drawFlags) | @enumToInt(DTF.CALCRECT));
-                    _ = wingdi.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &rect, drawFlags);
-                    var rectCalc = rect;
-                    _ = wingdi.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &rectCalc, calcFlags);
-                    rect.right -= rectCalc.right + block.padLeft;
+                    rect.Width -= @intToFloat(f32, block.padRight);
+                    var format: ?*C.GpStringFormat = null;
+                    gpAssert(@src(), C.GdipStringFormatGetGenericDefault(&format));
+                    gpAssert(@src(), C.GdipDrawString(self.gfx, block.wtext, @intCast(c_int, block.wtext.len), block.font.handle, &rect, format, block.brush));
+
+                    // TODO: Remove this
+                    var orect = C.RECT{ .left = 0, .top = 0, .right = sz.cx, .bottom = sz.cy };
+                    _ = C.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &orect, 0);
+
+                    // var rectCalc = rect;
+                    // _ = C.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &rectCalc, calcFlags);
+                    // rect.right -= rectCalc.right + block.padLeft;
                 }
             }
         }
 
         // Update window
-        var blendfn = wingdi.BLENDFUNCTION{
-            .BlendOp = wingdi.AC_SRC_OVER,
+        var blendfn = C.BLENDFUNCTION{
+            .BlendOp = C.AC_SRC_OVER,
             .BlendFlags = 0,
             .SourceConstantAlpha = 255,
-            .AlphaFormat = wingdi.AC_SRC_ALPHA,
+            .AlphaFormat = C.AC_SRC_ALPHA,
         };
-        var ptSrc = std.mem.zeroes(winfon.POINT);
-        _ = winwin.UpdateLayeredWindow(self.wnd, self.screenDC, &pt, &sz, self.barDC, &ptSrc, 0, &blendfn, .ALPHA);
+        var ptSrc = std.mem.zeroes(C.POINT);
+        _ = C.UpdateLayeredWindow(self.wnd.?, self.screenDC, &pt, &sz, self.barDC, &ptSrc, 0, &blendfn, C.ULW_ALPHA);
     }
 };
 
@@ -517,10 +517,21 @@ fn jsThread(manager: *BarManager) void {
 }
 
 pub fn main() !void {
+    std.log.debug("Init", .{});
     const GPA = std.heap.GeneralPurposeAllocator(.{});
     var gpa = GPA{};
     gpalloc = gpa.allocator();
     defer _ = gpa.deinit();
+
+    var gdiplusToken: c_ulonglong = 0;
+    var gdiplusStartup = C.GdiplusStartupInput{
+        .GdiplusVersion = 1,
+        .DebugEventCallback = null,
+        .SuppressBackgroundThread = 0,
+        .SuppressExternalCodecs = 0,
+    };
+    gpAssert(@src(), C.GdiplusStartup(&gdiplusToken, &gdiplusStartup, null));
+    defer C.GdiplusShutdown(gdiplusToken);
 
     var manager = try BarManager.init();
     defer manager.deinit();
@@ -528,10 +539,10 @@ pub fn main() !void {
     while (true) {
         try manager.bar.checkUpdate(); // TODO: move elsewhere
 
-        var msg: winwin.MSG = undefined;
-        while (winwin.PeekMessage(&msg, null, 0, 0, .REMOVE) != 0) {
-            _ = winwin.TranslateMessage(&msg);
-            _ = winwin.DispatchMessage(&msg);
+        var msg: C.MSG = undefined;
+        while (C.PeekMessageA(&msg, null, 0, 0, C.PM_REMOVE) != 0) {
+            _ = C.TranslateMessage(&msg);
+            _ = C.DispatchMessageA(&msg);
         }
 
         std.time.sleep(10_000_000); // 10 ms

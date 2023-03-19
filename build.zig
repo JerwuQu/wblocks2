@@ -9,17 +9,16 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    const zigwin32 = b.createModule(.{ .source_file = .{ .path = "third_party/zigwin32/win32.zig" } });
-
     const exe = b.addExecutable(.{
         .name = "wblocks",
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
-    exe.addModule("win32", zigwin32);
 
     exe.linkLibC();
+    exe.linkSystemLibrary("gdi32");
+    exe.linkSystemLibrary("gdiplus");
 
     // Manually link pthread since zig doesn't ship with it
     // https://github.com/ziglang/zig/issues/10989
