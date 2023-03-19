@@ -338,15 +338,10 @@ const BarWindow = struct {
 
     // On error, recreate window
     fn checkUpdate(self: *BarWindow) !void {
-        // TODO
-        _ = self;
-        // var cmpRect: winfon.RECT = undefined;
-        // if (winwin.GetWindowRect(self.taskbar, cmpRect) == 0) {
-        //     return error.TaskBarSizeError;
-        // }
-        // if (!std.mem.eql(winfon.RECT, &cmpRect, self.taskbarRect)) {
-        //     try self.update();
-        // }
+        var sz = try self.getSupposedSize();
+        if (sz.cx != self.drawSize.cx or sz.cy != self.drawSize.cy) {
+            try self.update();
+        }
     }
     // On error, recreate window
     fn update(self: *BarWindow) !void {
@@ -527,10 +522,12 @@ pub fn main() !void {
     gpalloc = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var manager = BarManager.init();
+    var manager = try BarManager.init();
     defer manager.deinit();
 
     while (true) {
+        try manager.bar.checkUpdate(); // TODO: move elsewhere
+
         var msg: winwin.MSG = undefined;
         while (winwin.PeekMessage(&msg, null, 0, 0, .REMOVE) != 0) {
             _ = winwin.TranslateMessage(&msg);
