@@ -55,7 +55,9 @@ pub const QJS = struct {
         if (ValT == void) {
             return JS_UNDEFINED;
         } else if (@typeInfo(ValT) == .ErrorUnion) {
-            return fnWrapRetVal(ctx, val catch |err| return fnWrapRetVal(ctx, err));
+            return fnWrapRetVal(ctx, val catch |err| {
+                return C.JS_ThrowTypeError(ctx, fnWrapRetVal(ctx, err));
+            });
         } else if (comptime std.meta.trait.isZigString(ValT)) {
             // TODO: null-terminator?
             return C.JS_NewString(ctx, val);
@@ -65,6 +67,8 @@ pub const QJS = struct {
             return C.JS_NewInt64(ctx, @intCast(i64, val));
         } else if (ValT == bool) {
             return C.JS_NewBool(ctx, val);
+        } else if (ValT == JSValue) {
+            return val;
         } else {
             @compileError("Unknown type");
         }
@@ -80,7 +84,6 @@ pub const QJS = struct {
         const argCount = argFields.len;
         const fnWrap = struct {
             fn wrap(ctx: ?*C.JSContext, this: C.JSValueConst, argc: c_int, argv: [*c]C.JSValueConst) callconv(.C) JSValue {
-                _ = this;
                 if (ctx == null) {
                     @panic("JSContext == null");
                 }
@@ -121,6 +124,8 @@ pub const QJS = struct {
                             return C.JS_ThrowTypeError(ctx, "Invalid argument");
                         }
                         callArgs[i] = C.JS_VALUE_GET_BOOL(argv[i]) != 0;
+                    } else if (ArgT == C.JSValueConst) { // Assume "this"
+                        callArgs[i] = this;
                     } else {
                         @compileError("Unknown type");
                     }
