@@ -6,7 +6,9 @@ const winfon = win32.foundation;
 const winwin = win32.ui.windows_and_messaging;
 const winshl = win32.ui.shell;
 
-const QJS = @import("./qjs.zig").QJS;
+const qjs = @import("./qjs.zig");
+const QJSC = qjs.C;
+const QJS = qjs.QJS;
 
 var gpalloc: std.mem.Allocator = undefined;
 
@@ -75,20 +77,22 @@ const Block = struct {
         return default.?;
     }
     fn destroyDefault() void {
-        if (default != null) {
-            default.?.destroy();
+        if (default) |def| {
+            def.font.unRef();
+            gpalloc.destroy(def);
             default = null;
         }
     }
-    fn clone(self: *Block) *Block {
-        var new = gpalloc.dupe(Block, self);
-        new.wtext = self.wtext.clone(gpalloc);
+    fn clone(self: *Block) !*Block {
+        var new = try gpalloc.create(Block);
+        new.* = self.*;
+        new.wtext = try self.wtext.clone(gpalloc);
         new.font.addRef();
         return new;
     }
     fn destroy(self: *Block) void {
         if (self == default) {
-            default = null;
+            std.log.err("Attempt to destroy default block");
         }
         self.font.unRef();
         gpalloc.destroy(self);
@@ -106,15 +110,53 @@ const Block = struct {
     }
 };
 
-const BlockManager = struct {
-    blocks: std.ArrayListUnmanaged(Block) = &.{},
-    dirty: bool = true,
+const BarManager = struct {
+    blocks: std.ArrayListUnmanaged(*Block) = .{},
+    mutex: std.Thread.Mutex = .{},
+
+    bar: *BarWindow,
+    jsThread: std.Thread,
+
+    fn init() !*BarManager {
+        try BarWindow.init();
+        var self = try gpalloc.create(BarManager);
+        self.* = .{
+            .bar = try BarWindow.create(self),
+            .jsThread = try std.Thread.spawn(.{}, jsThread, .{self}),
+        };
+        return self;
+    }
+    fn deinit(self: *BarManager) void {
+        self.bar.destroy();
+        self.jsThread.join();
+        BarWindow.deinit();
+        Block.destroyDefault();
+    }
+
+    fn recreateBar(self: *BarManager) void {
+        self.bar.destroy();
+        self.bar = BarWindow.create(self) catch |ex2| {
+            std.log.err("Unable to recreate {}", .{ex2});
+            std.os.exit(1);
+        };
+    }
+    fn beginUpdate(self: *BarManager) void {
+        self.mutex.lock();
+    }
+    fn endUpdate(self: *BarManager) void {
+        self.mutex.unlock();
+        self.bar.update() catch |ex| {
+            std.log.err("Bar update failed: {}. Recreating.", .{ex});
+            self.recreateBar();
+        };
+    }
 };
 
-const Bar = struct {
+const BarWindow = struct {
     const TITLE = "wblocks bar";
     const CLASS = "WBLOCKS_BAR_CLASS";
-    const WM_WBLOCKS_TRAY = winwin.WM_USER + 1;
+    const WM_WBLOCKS_UPDATE = winwin.WM_USER + 1;
+    const WM_WBLOCKS_TRAY = winwin.WM_USER + 2;
     const TRAY_MENU_SHOW_LOG = 1;
     const TRAY_MENU_RELOAD = 2;
     const TRAY_MENU_EXIT = 3;
@@ -122,6 +164,9 @@ const Bar = struct {
     var trayIcon: winwin.HICON = undefined;
 
     taskbar: winfon.HWND,
+    manager: *BarManager,
+    taskbarRect: winfon.RECT = std.mem.zeroes(winfon.RECT),
+    drawSize: winfon.SIZE = std.mem.zeroes(winfon.SIZE),
 
     // Set once window has been created
     wnd: ?winfon.HWND = null,
@@ -148,18 +193,19 @@ const Bar = struct {
         _ = winwin.UnregisterClassA(CLASS, null);
         _ = winwin.DestroyIcon(trayIcon);
     }
-    fn create() !*Bar {
+
+    fn create(manager: *BarManager) !*BarWindow {
         const tray = winwin.FindWindowA("Shell_TrayWnd", null) orelse return error.TaskBarNotFound;
         const taskbar = winwin.FindWindowExA(tray, null, "ReBarWindow32", null) orelse return error.TaskBarNotFound;
 
-        var self = try gpalloc.create(Bar);
+        var self = try gpalloc.create(BarWindow);
         errdefer gpalloc.destroy(self);
 
-        self.* = .{ .taskbar = taskbar };
+        self.* = .{ .manager = manager, .taskbar = taskbar };
         self.wnd = winwin.CreateWindowExA(.LAYERED, CLASS, TITLE, .OVERLAPPED, 0, 0, 0, 0, taskbar, null, null, self) orelse return error.BarCreationFailed;
         return self;
     }
-    fn initWindow(self: *Bar, wnd: winfon.HWND) void {
+    fn initWindow(self: *BarWindow, wnd: winfon.HWND) void {
         // Set up *Bar reference
         self.wnd = wnd;
         _ = winwin.SetWindowLongPtrA(self.wnd, winwin.GWLP_USERDATA, @bitCast(isize, @ptrToInt(self)));
@@ -178,8 +224,15 @@ const Bar = struct {
         notifData.hIcon = trayIcon;
         std.mem.copy(u8, &notifData.szTip, "wblocks\x00");
         _ = winshl.Shell_NotifyIconA(.ADD, &notifData);
+
+        // Update
+        self.update() catch |err| {
+            std.log.err("Failed to update bar: {}", .{err});
+            self.manager.recreateBar();
+            return;
+        };
     }
-    fn destroy(self: *Bar) void {
+    fn destroy(self: *BarWindow) void {
         if (self.wnd == null) {
             return;
         }
@@ -198,28 +251,29 @@ const Bar = struct {
 
         gpalloc.destroy(self);
     }
-    fn fromWnd(wnd: winfon.HWND) !*Bar {
+    fn fromWnd(wnd: winfon.HWND) !*BarWindow {
         const value = winwin.GetWindowLongPtrA(wnd, winwin.GWLP_USERDATA);
         if (value == 0) {
             return error.NoBarWindow;
         }
-        return @intToPtr(*Bar, @bitCast(usize, value));
+        return @intToPtr(*BarWindow, @bitCast(usize, value));
     }
     fn wndProc(wnd: winfon.HWND, msg: u32, wParam: usize, lParam: isize) callconv(.C) isize {
         switch (msg) {
             winwin.WM_NCCREATE => {
                 var createData = @intToPtr(*winwin.CREATESTRUCTA, @bitCast(usize, lParam));
-                var bar = @ptrCast(*Bar, @alignCast(@alignOf(*Bar), createData.lpCreateParams));
+                var bar = @ptrCast(*BarWindow, @alignCast(@alignOf(*BarWindow), createData.lpCreateParams));
                 bar.initWindow(wnd);
             },
             winwin.WM_NCDESTROY => blk: {
                 var bar = fromWnd(wnd) catch break :blk;
-                std.log.warn("wblocks window died, probably due to explorer.exe crashing", .{});
-                bar.destroy();
+                std.log.warn("wblocks BarWindow died, probably due to explorer.exe crashing", .{});
+                bar.manager.recreateBar();
+                return 0;
             },
             WM_WBLOCKS_TRAY => blk: {
                 var bar = fromWnd(wnd) catch {
-                    std.log.err("Missing *Bar reference on window", .{});
+                    std.log.err("Missing *BarWindow reference on window", .{});
                     break :blk;
                 };
                 if ((lParam & 0xffff) == winwin.WM_LBUTTONUP or (lParam & 0xffff) == winwin.WM_RBUTTONUP) {
@@ -244,7 +298,7 @@ const Bar = struct {
                     } else if (cmd == TRAY_MENU_RELOAD) {
                         // TODO
                     } else if (cmd == TRAY_MENU_EXIT) {
-                        bar.destroy();
+                        bar.manager.deinit();
                         std.os.exit(0);
                     }
                 }
@@ -253,26 +307,124 @@ const Bar = struct {
         }
         return winwin.DefWindowProc(wnd, msg, wParam, lParam);
     }
+
+    // On error, destroy BarWindow
+    fn checkUpdate(self: *BarWindow) !void {
+        var cmpRect: winfon.RECT = undefined;
+        if (winwin.GetWindowRect(self.taskbar, cmpRect) == 0) {
+            return error.TaskBarSizeError;
+        }
+        if (!std.mem.eql(winfon.RECT, &cmpRect, self.taskbarRect)) {
+            try self.update();
+        }
+    }
+    // On error, destroy BarWindow
+    fn update(self: *BarWindow) !void {
+        // Get taskbar size
+        if (winwin.GetWindowRect(self.taskbar, &self.taskbarRect) == 0) {
+            return error.TaskBarSizeError;
+        }
+        const pt = winfon.POINT{
+            .x = @divFloor(self.taskbarRect.right - self.taskbarRect.left, 2),
+            .y = 0,
+        };
+        const sz = winfon.SIZE{
+            .cx = @divFloor(self.taskbarRect.right - self.taskbarRect.left, 2),
+            .cy = self.taskbarRect.bottom - self.taskbarRect.top,
+        };
+        std.log.debug("Pt: {},{} - Sz: {},{}", .{ pt.x, pt.y, sz.cx, sz.cy });
+
+        // TODO: https://github.com/JerwuQu/wblocks2/blob/master/src/main.cpp#L152
+    }
 };
 
-fn jsThreadErr() !void {
-    var js = try QJS.init();
-    defer js.deinit();
-    try js.eval("console.log('Hello from JS')");
+// Ran entirely on the JS thread
+const JSState = struct {
+    const JSStateQJS = QJS(JSState);
 
-    // const global = QJS.C.JS_GetGlobalObject(js.ctx);
-    // try js.addFunction(global, "add", struct {
-    //     fn asdf(a: usize, b: usize) usize {
-    //         return a + b;
-    //     }
-    // }.asdf);
-    // QJS.C.JS_FreeValue(js.ctx, global);
+    js: JSStateQJS,
+    manager: *BarManager,
+    blockClassId: QJSC.JSClassID,
 
-    try js.eval("console.log(add(123, 456));");
-}
+    fn run(manager: *BarManager) !void {
+        var self = try gpalloc.create(JSState);
+        defer gpalloc.destroy(self);
+        var js = try JSStateQJS.init(self);
+        self.* = .{
+            .js = js,
+            .manager = manager,
+            .blockClassId = 0,
+        };
 
-fn jsThread() void {
-    jsThreadErr() catch {
+        defer js.deinit();
+        const global = QJSC.JS_GetGlobalObject(js.ctx);
+        defer QJSC.JS_FreeValue(js.ctx, global);
+
+        // WB object
+        const wb = QJSC.JS_NewObject(js.ctx);
+        _ = QJSC.JS_SetPropertyStr(js.ctx, global, "wb", wb);
+
+        // Internal object
+        const wbInternal = QJSC.JS_NewObject(js.ctx);
+        _ = QJSC.JS_SetPropertyStr(js.ctx, wb, "internal", wbInternal);
+        try js.addFunction(wbInternal, "yield", js_yield);
+
+        // Register Block class
+        _ = QJSC.JS_NewClassID(&self.blockClassId);
+        var jsBlockClass = std.mem.zeroes(QJSC.JSClassDef);
+        jsBlockClass.class_name = "Block";
+        _ = QJSC.JS_NewClass(js.rt, self.blockClassId, &jsBlockClass);
+
+        // Block class prototype
+        const proto = QJSC.JS_NewObject(js.ctx);
+        // QJS_SET_PROP_FN(ctx, proto, "setFont", jsWrapBlockFn<jsBlockSetFont>, 2);
+        // QJS_SET_PROP_FN(ctx, proto, "setText", jsWrapBlockFn<jsBlockSetText>, 1);
+        // QJS_SET_PROP_FN(ctx, proto, "setColor", jsWrapBlockFn<jsBlockSetColor>, 3);
+        // QJS_SET_PROP_FN(ctx, proto, "setPadding", jsWrapBlockFn<jsBlockSetPadding>, 2);
+        // QJS_SET_PROP_FN(ctx, proto, "setVisible", jsWrapBlockFn<jsBlockSetVisible>, 1);
+        // QJS_SET_PROP_FN(ctx, proto, "clone", jsWrapBlockFn<jsBlockClone>, 1);
+        // QJS_SET_PROP_FN(ctx, proto, "remove", jsWrapBlockFn<jsBlockRemove>, 0);
+        QJSC.JS_SetClassProto(js.ctx, self.blockClassId, proto);
+
+        // Create default block
+        const jsDefaultBlock = QJSC.JS_NewObjectClass(js.ctx, @intCast(c_int, self.blockClassId));
+        QJSC.JS_SetOpaque(jsDefaultBlock, try Block.getDefault());
+        _ = QJSC.JS_SetPropertyStr(js.ctx, wb, "default", jsDefaultBlock);
+
+        // Main API
+        try js.addFunction(wb, "createBlock", js_createBlock);
+        // QJS_SET_PROP_FN(ctx, wb, "$", jsShell, 1);
+
+        // Load JS
+        try js.eval(@embedFile("lib.mjs"), true);
+
+        // Start event loop
+        QJSC.js_std_loop(js.ctx);
+
+        std.log.err("Unexpected js_std_loop end", .{});
+    }
+
+    /// Polled by JS runtime to handle events from other threads on this
+    fn js_yield(self: *JSState) void {
+        // TODO
+        _ = self;
+    }
+
+    fn js_createBlock(self: *JSState) !QJSC.JSValue {
+        var block = try (try Block.getDefault()).clone();
+        const obj = QJSC.JS_NewObjectClass(self.js.ctx, @intCast(c_int, self.blockClassId));
+        QJSC.JS_SetOpaque(obj, block);
+
+        self.manager.beginUpdate();
+        defer self.manager.endUpdate();
+        try self.manager.blocks.append(gpalloc, block);
+
+        return obj;
+    }
+};
+
+fn jsThread(manager: *BarManager) void {
+    JSState.run(manager) catch {
         std.log.err("Exiting due to JS thread error", .{});
         std.os.exit(1);
     };
@@ -284,13 +436,8 @@ pub fn main() !void {
     gpalloc = gpa.allocator();
     defer _ = gpa.deinit();
 
-    try Bar.init();
-    defer Bar.deinit();
-    var bar = try Bar.create();
-    defer bar.destroy();
-
-    var thread = try std.Thread.spawn(.{}, jsThread, .{});
-    defer thread.join();
+    var manager = BarManager.init();
+    defer manager.deinit();
 
     while (true) {
         var msg: winwin.MSG = undefined;
