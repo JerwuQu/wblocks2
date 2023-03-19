@@ -1,14 +1,12 @@
 const std = @import("std");
-const C = @cImport({
-    @cInclude("quickjs.h");
-    @cInclude("quickjs-libc.h");
-});
 
 const win32 = @import("win32");
 const wingdi = win32.graphics.gdi;
 const winfon = win32.foundation;
 const winwin = win32.ui.windows_and_messaging;
 const winshl = win32.ui.shell;
+
+const QJS = @import("./qjs.zig").QJS;
 
 var gpalloc: std.mem.Allocator = undefined;
 
@@ -257,52 +255,20 @@ const Bar = struct {
     }
 };
 
-const JS = struct {
-    rt: *C.JSRuntime,
-    ctx: *C.JSContext,
-
-    fn init() !JS {
-        const rt = C.JS_NewRuntime() orelse return error.QuickJSInitFailure;
-        errdefer C.JS_FreeRuntime(rt);
-
-        const ctx = C.JS_NewContext(rt) orelse return error.QuickJSInitFailure;
-        errdefer C.JS_FreeContext(ctx);
-
-        _ = C.js_init_module_std(ctx, "std");
-        _ = C.js_init_module_os(ctx, "os");
-        C.js_std_add_helpers(ctx, 0, null);
-
-        return .{
-            .rt = rt,
-            .ctx = ctx,
-        };
-    }
-    fn deinit(self: *JS) void {
-        C.JS_FreeContext(self.ctx);
-        C.JS_FreeRuntime(self.rt);
-    }
-    fn eval(self: *JS, codeZ: [:0]const u8) !void {
-        var retval = C.JS_Eval(self.ctx, codeZ.ptr, codeZ.len, "<eval>", C.JS_EVAL_TYPE_GLOBAL);
-        defer C.JS_FreeValue(self.ctx, retval);
-        try self.checkJSValue(retval);
-    }
-
-    fn checkJSValue(self: *JS, jsv: C.JSValue) !void {
-        if (C.JS_IsException(jsv) != 0) {
-            var exval = C.JS_GetException(self.ctx);
-            defer C.JS_FreeValue(self.ctx, exval);
-            var str = C.JS_ToCString(self.ctx, exval);
-            defer C.JS_FreeCString(self.ctx, str);
-            std.log.err("JS Exception: {s}", .{str});
-            return error.JSException;
-        }
-    }
-};
-
 fn jsThreadErr() !void {
-    var js = try JS.init();
+    var js = try QJS.init();
     defer js.deinit();
     try js.eval("console.log('Hello from JS')");
+
+    // const global = QJS.C.JS_GetGlobalObject(js.ctx);
+    // try js.addFunction(global, "add", struct {
+    //     fn asdf(a: usize, b: usize) usize {
+    //         return a + b;
+    //     }
+    // }.asdf);
+    // QJS.C.JS_FreeValue(js.ctx, global);
+
+    try js.eval("console.log(add(123, 456));");
 }
 
 fn jsThread() void {
