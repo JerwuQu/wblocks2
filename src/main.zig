@@ -83,7 +83,7 @@ const Block = struct {
             default = null;
         }
     }
-    fn clone(self: *Block) !*Block {
+    fn clone(self: *const Block) !*Block {
         var new = try gpalloc.create(Block);
         new.* = self.*;
         new.wtext = try self.wtext.clone(gpalloc);
@@ -92,16 +92,17 @@ const Block = struct {
     }
     fn destroy(self: *Block) void {
         if (self == default) {
-            std.log.err("Attempt to destroy default block");
+            std.log.err("Attempt to destroy default block", .{});
         }
         self.font.unRef();
         gpalloc.destroy(self);
     }
     fn setText(self: *Block, text: []const u8) !void {
-        self.wtext.clearRetainingCapacity(gpalloc);
-        self.wtext.ensureTotalCapacity(gpalloc, text.len);
+        self.wtext.clearRetainingCapacity();
+        try self.wtext.ensureTotalCapacity(gpalloc, text.len);
+        self.wtext.expandToCapacity();
         var len = try std.unicode.utf8ToUtf16Le(self.wtext.items, text);
-        self.wtext.shrinkRetainingCapacity(gpalloc, len);
+        self.wtext.shrinkRetainingCapacity(len);
     }
     fn setFont(self: *Block, name: []const u8, size: isize) !void {
         const new = try FontRef.create(name, size);
@@ -298,7 +299,8 @@ const BarWindow = struct {
                     } else if (cmd == TRAY_MENU_RELOAD) {
                         // TODO
                     } else if (cmd == TRAY_MENU_EXIT) {
-                        bar.manager.deinit();
+                        // TODO: bar.manager.deinit();
+                        _ = bar;
                         std.os.exit(0);
                     }
                 }
@@ -377,13 +379,14 @@ const JSState = struct {
 
         // Block class prototype
         const proto = QJSC.JS_NewObject(js.ctx);
+        try js.addFunction(proto, "clone", js_BlockClone);
+        try js.addFunction(proto, "destroy", js_BlockDestroy);
+        try js.addFunction(proto, "setText", js_BlockSetText);
         // QJS_SET_PROP_FN(ctx, proto, "setFont", jsWrapBlockFn<jsBlockSetFont>, 2);
         // QJS_SET_PROP_FN(ctx, proto, "setText", jsWrapBlockFn<jsBlockSetText>, 1);
         // QJS_SET_PROP_FN(ctx, proto, "setColor", jsWrapBlockFn<jsBlockSetColor>, 3);
         // QJS_SET_PROP_FN(ctx, proto, "setPadding", jsWrapBlockFn<jsBlockSetPadding>, 2);
         // QJS_SET_PROP_FN(ctx, proto, "setVisible", jsWrapBlockFn<jsBlockSetVisible>, 1);
-        // QJS_SET_PROP_FN(ctx, proto, "clone", jsWrapBlockFn<jsBlockClone>, 1);
-        // QJS_SET_PROP_FN(ctx, proto, "remove", jsWrapBlockFn<jsBlockRemove>, 0);
         QJSC.JS_SetClassProto(js.ctx, self.blockClassId, proto);
 
         // Create default block
@@ -404,22 +407,47 @@ const JSState = struct {
         std.log.err("Unexpected js_std_loop end", .{});
     }
 
+    fn jsGetThisBlock(self: *JSState, this: QJSC.JSValue) *Block {
+        return @ptrCast(*Block, @alignCast(@alignOf(*Block), QJSC.JS_GetOpaque(this, self.blockClassId)));
+    }
+    fn jsCloneBlock(self: *JSState, block: *const Block) !QJSC.JSValue {
+        var clone = try block.clone();
+        const obj = QJSC.JS_NewObjectClass(self.js.ctx, @intCast(c_int, self.blockClassId));
+        QJSC.JS_SetOpaque(obj, clone);
+
+        self.manager.beginUpdate();
+        defer self.manager.endUpdate();
+        try self.manager.blocks.append(gpalloc, clone);
+
+        return obj;
+    }
+
     /// Polled by JS runtime to handle events from other threads on this
     fn js_yield(self: *JSState) void {
         // TODO
         _ = self;
     }
-
     fn js_createBlock(self: *JSState) !QJSC.JSValue {
-        var block = try (try Block.getDefault()).clone();
-        const obj = QJSC.JS_NewObjectClass(self.js.ctx, @intCast(c_int, self.blockClassId));
-        QJSC.JS_SetOpaque(obj, block);
-
+        return self.jsCloneBlock(try Block.getDefault());
+    }
+    fn js_BlockClone(self: *JSState, this: QJSC.JSValue) !QJSC.JSValue {
+        return self.jsCloneBlock(self.jsGetThisBlock(this));
+    }
+    fn js_BlockDestroy(self: *JSState, this: QJSC.JSValue) void {
         self.manager.beginUpdate();
         defer self.manager.endUpdate();
-        try self.manager.blocks.append(gpalloc, block);
-
-        return obj;
+        var block = self.jsGetThisBlock(this);
+        block.destroy();
+        const idx = std.mem.indexOfScalar(*Block, self.manager.blocks.items, block);
+        if (idx != null) {
+            _ = self.manager.blocks.orderedRemove(idx.?);
+        }
+    }
+    fn js_BlockSetText(self: *JSState, this: QJSC.JSValueConst, text: []const u8) !void {
+        self.manager.beginUpdate();
+        defer self.manager.endUpdate();
+        var block = self.jsGetThisBlock(this);
+        try block.setText(text);
     }
 };
 

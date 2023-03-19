@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         "third_party/quickjs/libbf.c",
         "third_party/quickjs/libunicode.c",
     }, &[_][]const u8{
+        "-DDUMP_LEAKS",
         "-DCONFIG_BIGNUM",
         "-DCONFIG_VERSION=\"" ++ (comptime std.mem.trim(u8, @embedFile("third_party/quickjs/VERSION"), " \n\r\t")) ++ "\"",
     });

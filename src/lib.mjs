@@ -50,7 +50,9 @@ globalThis.$psFetch = async url => {
 console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
 
 console.log("Hello from lib.mjs!");
-console.log(wb.createBlock());
+const block = wb.createBlock();
+block.setText('Hello');
+console.log(block);
 
 // Load all scripts within the `blocks` dir
 // const [files, err] = os.readdir('./blocks');

@@ -9,6 +9,7 @@ pub fn QJS(comptime UserDataT: type) type {
         const Self = @This();
 
         pub const JSValue = C.JSValue;
+        pub const JSValueConst = C.JSValueConst;
 
         // NOTE: there's some translate-c bug so the #define JS_UNDEFINED doesn't work
         pub const JS_UNDEFINED = JSValue{ .tag = C.JS_TAG_UNDEFINED, .u = .{ .int32 = 0 } };
@@ -74,7 +75,7 @@ pub fn QJS(comptime UserDataT: type) type {
                 return C.JS_NewInt64(ctx, @intCast(i64, val));
             } else if (ValT == bool) {
                 return C.JS_NewBool(ctx, val);
-            } else if (ValT == JSValue) {
+            } else if (ValT == JSValue or ValT == JSValueConst) {
                 return val;
             } else {
                 @compileError("Unknown type");
@@ -88,52 +89,62 @@ pub fn QJS(comptime UserDataT: type) type {
             }
             const ArgsTup = std.meta.ArgsTuple(T);
             const argFields = std.meta.fields(ArgsTup);
-            const argCount = argFields.len;
+            const argFieldCount = argFields.len;
+            const hasJSThisArg = argFields.len >= 2 and argFields[1].type == JSValueConst;
+            const argStart = if (hasJSThisArg) 2 else 1; // Skip 'zig self' and 'js this'
+            const expectedJSArgCount = argFieldCount - argStart;
+
             const fnWrap = struct {
-                fn wrap(ctx: ?*C.JSContext, this: C.JSValueConst, argc: c_int, argv: [*c]C.JSValueConst) callconv(.C) JSValue {
+                fn wrap(ctx: ?*C.JSContext, this: JSValueConst, argc: c_int, argv: [*c]JSValueConst) callconv(.C) JSValue {
                     if (ctx == null) {
                         @panic("JSContext == null");
                     }
                     var callArgs: ArgsTup = undefined;
+
+                    // Set self - always first arg
                     callArgs[0] = @ptrCast(*UserDataT, @alignCast(@alignOf(*UserDataT), C.JS_GetContextOpaque(ctx)));
-                    if (argc + 1 != argCount) {
+                    if (argc != expectedJSArgCount) {
                         return C.JS_ThrowTypeError(ctx, "Invalid argument count");
                     }
+
+                    // Set JS this - always second arg (if requested)
+                    if (hasJSThisArg) {
+                        callArgs[1] = this;
+                    }
+
                     defer {
-                        inline for (1..argFields.len) |i| {
-                            const ArgT = argFields[i].type;
-                            if (comptime std.meta.trait.isZigString(ArgT)) {
-                                C.JS_FreeCString(ctx, callArgs[i]);
+                        inline for (argStart..argFields.len) |zigI| {
+                            if (comptime std.meta.trait.isZigString(argFields[zigI].type)) {
+                                C.JS_FreeCString(ctx, callArgs[zigI].ptr);
                             }
                         }
                     }
-                    inline for (1..argFields.len) |i| {
-                        const ArgT = argFields[i].type;
+                    inline for (argStart..argFields.len, 0..) |zigI, jsI| {
+                        const ArgT = argFields[zigI].type;
+                        const jsArg = argv[jsI];
                         if (comptime std.meta.trait.isZigString(ArgT)) {
-                            if (C.JS_IsString(argv[i]) == 0) {
-                                return C.JS_ThrowTypeError(ctx, "Invalid argument");
+                            if (C.JS_IsString(jsArg) == 0) {
+                                return C.JS_ThrowTypeError(ctx, "Invalid argument: Expected string");
                             }
-                            callArgs[i] = C.JS_ToCString(ctx, argv[i]);
+                            callArgs[zigI] = std.mem.span(C.JS_ToCString(ctx, jsArg));
                         } else if (comptime std.meta.trait.isNumber(ArgT)) {
-                            if (C.JS_IsNumber(argv[i]) == 0) {
-                                return C.JS_ThrowTypeError(ctx, "Invalid argument");
+                            if (C.JS_IsNumber(jsArg) == 0) {
+                                return C.JS_ThrowTypeError(ctx, "Invalid argument: Expected number");
                             }
                             if (comptime std.meta.trait.isFloat(ArgT)) {
                                 var val: f64 = undefined;
-                                _ = C.JS_ToFloat64(ctx, &val, argv[i]);
-                                callArgs[i] = @floatCast(ArgT, val);
+                                _ = C.JS_ToFloat64(ctx, &val, jsArg);
+                                callArgs[zigI] = @floatCast(ArgT, val);
                             } else {
                                 var val: i64 = undefined;
-                                _ = C.JS_ToInt64(ctx, &val, argv[i]);
-                                callArgs[i] = @intCast(ArgT, val);
+                                _ = C.JS_ToInt64(ctx, &val, jsArg);
+                                callArgs[zigI] = @intCast(ArgT, val);
                             }
                         } else if (ArgT == bool) {
-                            if (C.JS_IsBool(argv[i]) == 0) {
-                                return C.JS_ThrowTypeError(ctx, "Invalid argument");
+                            if (C.JS_IsBool(jsArg) == 0) {
+                                return C.JS_ThrowTypeError(ctx, "Invalid argument: Expected bool");
                             }
-                            callArgs[i] = C.JS_VALUE_GET_BOOL(argv[i]) != 0;
-                        } else if (ArgT == C.JSValueConst) { // Assume "this"
-                            callArgs[i] = this;
+                            callArgs[zigI] = C.JS_VALUE_GET_BOOL(jsArg) != 0;
                         } else {
                             @compileError("Unknown type");
                         }
@@ -142,7 +153,8 @@ pub fn QJS(comptime UserDataT: type) type {
                     return fnWrapRetVal(ctx.?, @call(.auto, func, callArgs));
                 }
             }.wrap;
-            const jsfn = C.JS_NewCFunction(self.ctx, fnWrap, name, argCount);
+
+            const jsfn = C.JS_NewCFunction(self.ctx, fnWrap, name, expectedJSArgCount);
             _ = C.JS_SetPropertyStr(self.ctx, parent, name, jsfn);
         }
     };
