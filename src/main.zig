@@ -20,34 +20,44 @@ fn gpAssert(comptime src: std.builtin.SourceLocation, status: C.GpStatus) void {
 }
 
 const FontRef = struct {
-    handle: *C.GpFont,
+    var collection: ?*C.GpFontCollection = null;
+
+    family: ?*C.GpFontFamily,
+    font: ?*C.GpFont,
     refs: usize,
 
     // Create and add reference
-    fn create(name: []const u8, size: isize) !*FontRef {
+    fn create(name: []const u8, size: usize) !*FontRef {
         const wname = try std.unicode.utf8ToUtf16LeWithNull(gpalloc, name);
         defer gpalloc.free(wname);
 
-        // TODO
-        var ff: ?*C.GpFontFamily = null;
-        gpAssert(@src(), C.GdipGetGenericFontFamilySansSerif(&ff));
-        var handle: ?*C.GpFont = null;
-        gpAssert(@src(), C.GdipCreateFont(ff, @intToFloat(f32, size), C.FontStyleRegular, C.UnitPixel, &handle));
+        if (collection == null) {
+            gpAssert(@src(), C.GdipNewInstalledFontCollection(&collection));
+        }
+
+        var family: ?*C.GpFontFamily = null;
+        gpAssert(@src(), C.GdipCreateFontFamilyFromName(wname, collection, &family));
+        var font: ?*C.GpFont = null;
+        gpAssert(@src(), C.GdipCreateFont(family, @intToFloat(f32, size), C.FontStyleRegular, C.UnitPixel, &font));
 
         var self = try gpalloc.create(FontRef);
         self.* = .{
-            .handle = handle.?,
+            .family = family,
+            .font = font,
             .refs = 1,
         };
         return self;
     }
     fn addRef(self: *FontRef) void {
         self.refs += 1;
+        std.log.debug("Add ref {d}", .{self.refs});
     }
     fn unRef(self: *FontRef) void {
         self.refs -= 1;
+        std.log.debug("Unref {d}", .{self.refs});
         if (self.refs == 0) {
-            // TODO _ = C.DeleteObject(self.handle);
+            _ = C.GdipDeleteFont(self.font);
+            _ = C.GdipDeleteFontFamily(self.family);
             gpalloc.destroy(self);
         }
     }
@@ -69,7 +79,7 @@ const Block = struct {
             default = try gpalloc.create(Block);
             default.?.* = .{
                 .wtext = try std.unicode.utf8ToUtf16LeWithNull(gpalloc, ""),
-                .font = try FontRef.create("Arial", 40),
+                .font = try FontRef.create("Arial", 20),
             };
             gpAssert(@src(), C.GdipCreateSolidFill(0xffffffff, &default.?.brush));
         }
@@ -86,6 +96,7 @@ const Block = struct {
         var new = try gpalloc.create(Block);
         new.* = self.*;
         new.wtext = try gpalloc.dupeZ(u16, self.wtext);
+        gpAssert(@src(), C.GdipCloneBrush(self.brush, &new.brush));
         new.font.addRef();
         return new;
     }
@@ -93,6 +104,7 @@ const Block = struct {
         if (self == default) {
             std.log.err("Attempt to destroy default block", .{});
         }
+        gpAssert(@src(), C.GdipDeleteBrush(self.brush));
         self.font.unRef();
         gpalloc.destroy(self);
     }
@@ -101,16 +113,20 @@ const Block = struct {
         gpalloc.free(self.wtext);
         self.wtext = new;
     }
-    fn setFont(self: *Block, name: []const u8, size: isize) !void {
+    fn setFont(self: *Block, name: []const u8, size: usize) !void {
         const new = try FontRef.create(name, size);
         self.font.unRef();
         self.font = new;
+    }
+    fn setColor(self: *Block, r: u8, g: u8, b: u8, a: u8) void {
+        gpAssert(@src(), C.GdipSetSolidFillColor(self.brush, (@as(u32, r) << 16) | (@as(u32, g) << 8) | (@as(u32, b) << 0) | (@as(u32, a) << 24)));
     }
 };
 
 const BarManager = struct {
     blocks: std.ArrayListUnmanaged(*Block) = .{},
     mutex: std.Thread.Mutex = .{},
+    pendingUpdate: bool = false,
 
     bar: *BarWindow,
     jsThread: std.Thread,
@@ -145,9 +161,11 @@ const BarManager = struct {
     }
     /// Called by JS thread
     fn jsEndUpdate(self: *BarManager) void {
+        const doUpdate = !self.pendingUpdate;
+        self.pendingUpdate = true;
         self.mutex.unlock();
-        if (self.bar.wnd) |wnd| {
-            _ = C.PostMessageA(wnd, BarWindow.WM_WBLOCKS_UPDATE, 0, 0);
+        if (doUpdate and self.bar.wnd != null) {
+            _ = C.PostMessageA(self.bar.wnd.?, BarWindow.WM_WBLOCKS_UPDATE, 0, 0);
         }
     }
 };
@@ -307,6 +325,9 @@ const BarWindow = struct {
                     std.log.err("Missing *BarWindow reference on window", .{});
                     break :blk;
                 };
+                bar.manager.mutex.lock();
+                bar.manager.pendingUpdate = false;
+                bar.manager.mutex.unlock();
                 bar.update() catch |ex| {
                     std.log.err("Bar update failed: {}. Recreating.", .{ex});
                     bar.manager.recreateBar();
@@ -345,7 +366,7 @@ const BarWindow = struct {
         var sz = try self.getSupposedSize();
         std.log.debug("Pt: {},{} - Sz: {},{}", .{ pt.x, pt.y, sz.cx, sz.cy });
 
-        // Create bitmap
+        // Create bitmap and GDI+ gfx
         if (self.barBitmap == null or sz.cx != self.drawSize.cx or sz.cy != self.drawSize.cy) {
             std.log.debug("Creating bitmap", .{});
             self.drawSize = sz;
@@ -375,13 +396,17 @@ const BarWindow = struct {
                     rect.Width -= @intToFloat(f32, block.padRight);
                     var format: ?*C.GpStringFormat = null;
                     gpAssert(@src(), C.GdipStringFormatGetGenericDefault(&format));
+                    defer _ = C.GdipDeleteStringFormat(format);
                     gpAssert(@src(), C.GdipSetStringFormatFlags(format, C.StringFormatFlagsNoFitBlackBox | C.StringFormatFlagsNoWrap | C.StringFormatFlagsNoClip));
                     gpAssert(@src(), C.GdipSetStringFormatAlign(format, C.StringAlignmentFar));
-                    gpAssert(@src(), C.GdipDrawString(self.gfx, block.wtext, @intCast(c_int, block.wtext.len), block.font.handle, &rect, format, block.brush));
+                    gpAssert(@src(), C.GdipSetStringFormatLineAlign(format, C.StringAlignmentCenter));
+                    gpAssert(@src(), C.GdipDrawString(self.gfx, block.wtext, @intCast(c_int, block.wtext.len), block.font.font, &rect, format, block.brush));
 
-                    // var rectCalc = rect;
-                    // _ = C.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &rectCalc, calcFlags);
-                    // rect.right -= rectCalc.right + block.padLeft;
+                    var bbox: C.RectF = undefined;
+                    var cps: c_int = 0;
+                    var lines: c_int = 0;
+                    gpAssert(@src(), C.GdipMeasureString(self.gfx, block.wtext, @intCast(c_int, block.wtext.len), block.font.font, &rect, format, &bbox, &cps, &lines));
+                    rect.Width -= bbox.Width + @intToFloat(f32, block.padLeft);
                 }
             }
         }
@@ -440,11 +465,10 @@ const JSState = struct {
         try js.addFunction(proto, "clone", js_BlockClone);
         try js.addFunction(proto, "destroy", js_BlockDestroy);
         try js.addFunction(proto, "setText", js_BlockSetText);
-        // QJS_SET_PROP_FN(ctx, proto, "setFont", jsWrapBlockFn<jsBlockSetFont>, 2);
-        // QJS_SET_PROP_FN(ctx, proto, "setText", jsWrapBlockFn<jsBlockSetText>, 1);
-        // QJS_SET_PROP_FN(ctx, proto, "setColor", jsWrapBlockFn<jsBlockSetColor>, 3);
-        // QJS_SET_PROP_FN(ctx, proto, "setPadding", jsWrapBlockFn<jsBlockSetPadding>, 2);
-        // QJS_SET_PROP_FN(ctx, proto, "setVisible", jsWrapBlockFn<jsBlockSetVisible>, 1);
+        try js.addFunction(proto, "setFont", js_BlockSetFont);
+        try js.addFunction(proto, "setColor", js_BlockSetColor);
+        try js.addFunction(proto, "setPadding", js_BlockSetPadding);
+        try js.addFunction(proto, "setVisible", js_BlockSetVisible);
         QJSC.JS_SetClassProto(js.ctx, self.blockClassId, proto);
 
         // Create default block
@@ -508,6 +532,35 @@ const JSState = struct {
 
         var block = self.jsGetThisBlock(this);
         try block.setText(text);
+    }
+    fn js_BlockSetFont(self: *JSState, this: QJSC.JSValueConst, family: []const u8, size: usize) !void {
+        self.manager.jsBeginUpdate();
+        defer self.manager.jsEndUpdate();
+
+        var block = self.jsGetThisBlock(this);
+        try block.setFont(family, size);
+    }
+    fn js_BlockSetColor(self: *JSState, this: QJSC.JSValueConst, r: u8, g: u8, b: u8, a: u8) !void {
+        self.manager.jsBeginUpdate();
+        defer self.manager.jsEndUpdate();
+
+        var block = self.jsGetThisBlock(this);
+        block.setColor(r, g, b, a);
+    }
+    fn js_BlockSetPadding(self: *JSState, this: QJSC.JSValueConst, left: i32, right: i32) !void {
+        self.manager.jsBeginUpdate();
+        defer self.manager.jsEndUpdate();
+
+        var block = self.jsGetThisBlock(this);
+        block.padLeft = left;
+        block.padRight = right;
+    }
+    fn js_BlockSetVisible(self: *JSState, this: QJSC.JSValueConst, visible: bool) !void {
+        self.manager.jsBeginUpdate();
+        defer self.manager.jsEndUpdate();
+
+        var block = self.jsGetThisBlock(this);
+        block.visible = visible;
     }
 };
 

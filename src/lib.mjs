@@ -50,9 +50,24 @@ globalThis.$psFetch = async url => {
 console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
 
 console.log("Hello from lib.mjs!");
-const block = wb.createBlock();
-block.setText('Hello everyonnneeeeeeeeeee');
-console.log(block);
+const a = wb.createBlock();
+a.setFont('Comic Sans MS', 30);
+a.setColor(255, 0, 0, 255);
+a.setText('Red');
+const b = wb.createBlock();
+b.setFont('Arial Black', 30);
+b.setColor(0, 255, 0, 255);
+b.setText('Green');
+const c = wb.createBlock();
+c.setColor(0, 0, 255, 255);
+c.setText('Blue');
+const d = wb.createBlock();
+d.setColor(255, 255, 255, 100);
+d.setPadding(20, 20);
+d.setText('Alpha');
+const e = wb.createBlock();
+e.setVisible(false);
+e.setText('Invisible');
 
 // Load all scripts within the `blocks` dir
 // const [files, err] = os.readdir('./blocks');
