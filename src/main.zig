@@ -14,7 +14,7 @@ var gpalloc: std.mem.Allocator = undefined;
 
 fn gpAssert(comptime src: std.builtin.SourceLocation, status: C.GpStatus) void {
     if (status != 0) {
-        std.log.err("GDI+ error: {d} ({s}@{s}:{d})", .{ status, src.fn_name, src.file, src.line });
+        std.log.err("GDI+ error: {d} ({s} @ {s}:{d})", .{ status, src.fn_name, src.file, src.line });
         std.os.exit(1);
     }
 }
@@ -175,7 +175,7 @@ const BarWindow = struct {
     pvBits: [*c]u8 = null,
     screenDC: C.HDC = undefined,
     barDC: C.HDC = undefined,
-    gfx: ?*C.GpGraphics = undefined,
+    gfx: ?*C.GpGraphics = null,
 
     fn init() !void {
         // Reg class
@@ -206,9 +206,7 @@ const BarWindow = struct {
         errdefer gpalloc.destroy(self);
 
         self.* = .{ .manager = manager, .taskbarWnd = taskbarWnd, .trayWnd = trayWnd };
-        const wexstyle = 0x00080000 | 0x00000020; // translate-c bug (C.WS_EX_LAYERED | C.WS_EX_TRANSPARENT)
-        const wstyle = @as(c_longlong, 0x80000000) & ~@as(c_longlong, 0x00800000); // translate-c bug (C.WS_POPUP & ~C.WS_BORDER)
-        self.wnd = C.CreateWindowExA(wexstyle, CLASS, TITLE, wstyle, 0, 0, 0, 0, taskbarWnd, null, null, self) orelse return error.BarCreationFailed;
+        self.wnd = C.CreateWindowExA(C.WS_EX_LAYERED, CLASS, TITLE, 0, 0, 0, 0, 0, taskbarWnd, null, null, self) orelse return error.BarCreationFailed;
         return self;
     }
     fn initWindow(self: *BarWindow, wnd: C.HWND) void {
@@ -220,7 +218,6 @@ const BarWindow = struct {
         // Alloc resources
         self.screenDC = C.GetDC(null) orelse @panic("GetDC failed");
         self.barDC = C.CreateCompatibleDC(self.screenDC);
-        gpAssert(@src(), C.GdipCreateFromHDC(self.barDC, &self.gfx));
 
         // Create tray icon
         var notifData = std.mem.zeroes(C.NOTIFYICONDATAA);
@@ -232,8 +229,7 @@ const BarWindow = struct {
         std.mem.copy(u8, &notifData.szTip, "wblocks\x00");
         _ = C.Shell_NotifyIconA(C.NIM_ADD, &notifData);
 
-        // Show and update
-        _ = C.ShowWindow(wnd, C.SW_SHOW);
+        // Update
         self.update() catch |err| {
             std.log.err("Failed to update bar on creation: {}, exiting", .{err});
             std.os.exit(1);
@@ -358,24 +354,30 @@ const BarWindow = struct {
             }
             self.barBitmap = C.CreateCompatibleBitmap(self.screenDC, sz.cx, sz.cy);
             _ = C.SelectObject(self.barDC, self.barBitmap.?);
+
+            if (self.gfx != null) {
+                _ = C.GdipDeleteGraphics(self.gfx);
+            }
+            gpAssert(@src(), C.GdipCreateFromHDC(self.barDC, &self.gfx));
+            gpAssert(@src(), C.GdipSetSmoothingMode(self.gfx, C.SmoothingModeAntiAlias8x8));
+            gpAssert(@src(), C.GdipSetTextRenderingHint(self.gfx, C.TextRenderingHintAntiAlias));
         }
 
         // Draw blocks
         {
             std.log.debug("Drawing blocks", .{});
+            gpAssert(@src(), C.GdipGraphicsClear(self.gfx, 0x00000000));
             self.manager.mutex.lock();
             defer self.manager.mutex.unlock();
-            var rect = C.RectF{ .X = 1000, .Y = 0, .Width = @intToFloat(f32, sz.cx), .Height = @intToFloat(f32, sz.cy) + 100 };
+            var rect = C.RectF{ .X = 0, .Y = 0, .Width = @intToFloat(f32, sz.cx), .Height = @intToFloat(f32, sz.cy) };
             for (self.manager.blocks.items) |block| {
                 if (block.visible) {
                     rect.Width -= @intToFloat(f32, block.padRight);
                     var format: ?*C.GpStringFormat = null;
                     gpAssert(@src(), C.GdipStringFormatGetGenericDefault(&format));
+                    gpAssert(@src(), C.GdipSetStringFormatFlags(format, C.StringFormatFlagsNoFitBlackBox | C.StringFormatFlagsNoWrap | C.StringFormatFlagsNoClip));
+                    gpAssert(@src(), C.GdipSetStringFormatAlign(format, C.StringAlignmentFar));
                     gpAssert(@src(), C.GdipDrawString(self.gfx, block.wtext, @intCast(c_int, block.wtext.len), block.font.handle, &rect, format, block.brush));
-
-                    // TODO: Remove this
-                    var orect = C.RECT{ .left = 0, .top = 0, .right = sz.cx, .bottom = sz.cy };
-                    _ = C.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &orect, 0);
 
                     // var rectCalc = rect;
                     // _ = C.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &rectCalc, calcFlags);
