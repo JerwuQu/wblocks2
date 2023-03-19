@@ -12,9 +12,6 @@ const QJS = qjs.QJS;
 
 var gpalloc: std.mem.Allocator = undefined;
 
-// TODO: use std.atomic.Queue
-// TODO: use std.Thread
-
 const FontRef = struct {
     handle: wingdi.HFONT,
     refs: usize,
@@ -61,18 +58,21 @@ const FontRef = struct {
 const Block = struct {
     var default: ?*Block = null;
 
-    wtext: std.ArrayListUnmanaged(u16) = .{},
+    wtext: [:0]const u16,
     font: *FontRef,
 
     visible: bool = true,
     color: u32 = 0x00ffffff, // https://learn.microsoft.com/en-us/windows/win32/gdi/colorref
-    padLeft: usize = 5,
-    padRight: usize = 5,
+    padLeft: i32 = 5,
+    padRight: i32 = 5,
 
     fn getDefault() !*Block {
         if (default == null) {
             default = try gpalloc.create(Block);
-            default.?.* = .{ .font = try FontRef.create("Arial", 32) };
+            default.?.* = .{
+                .wtext = try std.unicode.utf8ToUtf16LeWithNull(gpalloc, ""),
+                .font = try FontRef.create("Arial", 24),
+            };
         }
         return default.?;
     }
@@ -86,7 +86,7 @@ const Block = struct {
     fn clone(self: *const Block) !*Block {
         var new = try gpalloc.create(Block);
         new.* = self.*;
-        new.wtext = try self.wtext.clone(gpalloc);
+        new.wtext = try gpalloc.dupeZ(u16, self.wtext);
         new.font.addRef();
         return new;
     }
@@ -98,11 +98,9 @@ const Block = struct {
         gpalloc.destroy(self);
     }
     fn setText(self: *Block, text: []const u8) !void {
-        self.wtext.clearRetainingCapacity();
-        try self.wtext.ensureTotalCapacity(gpalloc, text.len);
-        self.wtext.expandToCapacity();
-        var len = try std.unicode.utf8ToUtf16Le(self.wtext.items, text);
-        self.wtext.shrinkRetainingCapacity(len);
+        const new = try std.unicode.utf8ToUtf16LeWithNull(gpalloc, text);
+        gpalloc.free(self.wtext);
+        self.wtext = new;
     }
     fn setFont(self: *Block, name: []const u8, size: isize) !void {
         const new = try FontRef.create(name, size);
@@ -121,10 +119,9 @@ const BarManager = struct {
     fn init() !*BarManager {
         try BarWindow.init();
         var self = try gpalloc.create(BarManager);
-        self.* = .{
-            .bar = try BarWindow.create(self),
-            .jsThread = try std.Thread.spawn(.{}, jsThread, .{self}),
-        };
+        self.* = .{ .bar = undefined, .jsThread = undefined };
+        self.bar = try BarWindow.create(self);
+        self.jsThread = try std.Thread.spawn(.{}, jsThread, .{self});
         return self;
     }
     fn deinit(self: *BarManager) void {
@@ -134,6 +131,7 @@ const BarManager = struct {
         Block.destroyDefault();
     }
 
+    /// Called by Window thread
     fn recreateBar(self: *BarManager) void {
         self.bar.destroy();
         self.bar = BarWindow.create(self) catch |ex2| {
@@ -141,15 +139,17 @@ const BarManager = struct {
             std.os.exit(1);
         };
     }
-    fn beginUpdate(self: *BarManager) void {
+
+    /// Called by JS thread
+    fn jsBeginUpdate(self: *BarManager) void {
         self.mutex.lock();
     }
-    fn endUpdate(self: *BarManager) void {
+    /// Called by JS thread
+    fn jsEndUpdate(self: *BarManager) void {
         self.mutex.unlock();
-        self.bar.update() catch |ex| {
-            std.log.err("Bar update failed: {}. Recreating.", .{ex});
-            self.recreateBar();
-        };
+        if (self.bar.wnd) |wnd| {
+            _ = winwin.PostMessage(wnd, BarWindow.WM_WBLOCKS_UPDATE, 0, 0);
+        }
     }
 };
 
@@ -164,13 +164,15 @@ const BarWindow = struct {
 
     var trayIcon: winwin.HICON = undefined;
 
-    taskbar: winfon.HWND,
     manager: *BarManager,
-    taskbarRect: winfon.RECT = std.mem.zeroes(winfon.RECT),
+
+    taskbarWnd: winfon.HWND,
+    trayWnd: winfon.HWND,
     drawSize: winfon.SIZE = std.mem.zeroes(winfon.SIZE),
 
     // Set once window has been created
     wnd: ?winfon.HWND = null,
+    barBitmap: ?wingdi.HBITMAP = null,
     screenDC: wingdi.HDC = undefined,
     barDC: wingdi.HDC = undefined,
 
@@ -196,21 +198,21 @@ const BarWindow = struct {
     }
 
     fn create(manager: *BarManager) !*BarWindow {
-        const tray = winwin.FindWindowA("Shell_TrayWnd", null) orelse return error.TaskBarNotFound;
-        const taskbar = winwin.FindWindowExA(tray, null, "ReBarWindow32", null) orelse return error.TaskBarNotFound;
+        const taskbarWnd = winwin.FindWindowA("Shell_TrayWnd", null) orelse return error.TaskBarNotFound;
+        const trayWnd = winwin.FindWindowExA(taskbarWnd, null, "TrayNotifyWnd", null) orelse return error.TaskBarNotFound;
 
         var self = try gpalloc.create(BarWindow);
         errdefer gpalloc.destroy(self);
 
-        self.* = .{ .manager = manager, .taskbar = taskbar };
-        self.wnd = winwin.CreateWindowExA(.LAYERED, CLASS, TITLE, .OVERLAPPED, 0, 0, 0, 0, taskbar, null, null, self) orelse return error.BarCreationFailed;
+        self.* = .{ .manager = manager, .taskbarWnd = taskbarWnd, .trayWnd = trayWnd };
+        self.wnd = winwin.CreateWindowExA(.LAYERED, CLASS, TITLE, .OVERLAPPED, 0, 0, 0, 0, taskbarWnd, null, null, self) orelse return error.BarCreationFailed;
         return self;
     }
     fn initWindow(self: *BarWindow, wnd: winfon.HWND) void {
         // Set up *Bar reference
         self.wnd = wnd;
         _ = winwin.SetWindowLongPtrA(self.wnd, winwin.GWLP_USERDATA, @bitCast(isize, @ptrToInt(self)));
-        _ = winwin.SetParent(self.wnd, self.taskbar);
+        _ = winwin.SetParent(self.wnd, self.taskbarWnd);
 
         // Alloc resources
         self.screenDC = wingdi.GetDC(null) orelse @panic("GetDC failed");
@@ -228,9 +230,8 @@ const BarWindow = struct {
 
         // Update
         self.update() catch |err| {
-            std.log.err("Failed to update bar: {}", .{err});
-            self.manager.recreateBar();
-            return;
+            std.log.err("Failed to update bar on creation: {}, exiting", .{err});
+            std.os.exit(1);
         };
     }
     fn destroy(self: *BarWindow) void {
@@ -261,7 +262,7 @@ const BarWindow = struct {
     }
     fn wndProc(wnd: winfon.HWND, msg: u32, wParam: usize, lParam: isize) callconv(.C) isize {
         switch (msg) {
-            winwin.WM_NCCREATE => {
+            winwin.WM_CREATE => {
                 var createData = @intToPtr(*winwin.CREATESTRUCTA, @bitCast(usize, lParam));
                 var bar = @ptrCast(*BarWindow, @alignCast(@alignOf(*BarWindow), createData.lpCreateParams));
                 bar.initWindow(wnd);
@@ -305,38 +306,98 @@ const BarWindow = struct {
                     }
                 }
             },
+            WM_WBLOCKS_UPDATE => blk: {
+                var bar = fromWnd(wnd) catch {
+                    std.log.err("Missing *BarWindow reference on window", .{});
+                    break :blk;
+                };
+                bar.update() catch |ex| {
+                    std.log.err("Bar update failed: {}. Recreating.", .{ex});
+                    bar.manager.recreateBar();
+                };
+            },
             else => {},
         }
         return winwin.DefWindowProc(wnd, msg, wParam, lParam);
     }
 
-    // On error, destroy BarWindow
-    fn checkUpdate(self: *BarWindow) !void {
-        var cmpRect: winfon.RECT = undefined;
-        if (winwin.GetWindowRect(self.taskbar, cmpRect) == 0) {
+    fn getSupposedSize(self: *BarWindow) !winfon.SIZE {
+        var taskbarRect: winfon.RECT = undefined;
+        if (winwin.GetWindowRect(self.taskbarWnd, &taskbarRect) == 0) {
             return error.TaskBarSizeError;
         }
-        if (!std.mem.eql(winfon.RECT, &cmpRect, self.taskbarRect)) {
-            try self.update();
+        var trayRect: winfon.RECT = undefined;
+        if (winwin.GetWindowRect(self.trayWnd, &trayRect) == 0) {
+            return error.TaskBarSizeError;
         }
+        return winfon.SIZE{
+            .cx = (taskbarRect.right - taskbarRect.left) - (trayRect.right - trayRect.left),
+            .cy = taskbarRect.bottom - taskbarRect.top,
+        };
     }
-    // On error, destroy BarWindow
+
+    // On error, recreate window
+    fn checkUpdate(self: *BarWindow) !void {
+        // TODO
+        _ = self;
+        // var cmpRect: winfon.RECT = undefined;
+        // if (winwin.GetWindowRect(self.taskbar, cmpRect) == 0) {
+        //     return error.TaskBarSizeError;
+        // }
+        // if (!std.mem.eql(winfon.RECT, &cmpRect, self.taskbarRect)) {
+        //     try self.update();
+        // }
+    }
+    // On error, recreate window
     fn update(self: *BarWindow) !void {
-        // Get taskbar size
-        if (winwin.GetWindowRect(self.taskbar, &self.taskbarRect) == 0) {
-            return error.TaskBarSizeError;
-        }
-        const pt = winfon.POINT{
-            .x = @divFloor(self.taskbarRect.right - self.taskbarRect.left, 2),
-            .y = 0,
-        };
-        const sz = winfon.SIZE{
-            .cx = @divFloor(self.taskbarRect.right - self.taskbarRect.left, 2),
-            .cy = self.taskbarRect.bottom - self.taskbarRect.top,
-        };
+        var pt = winfon.POINT{ .x = 0, .y = 0 };
+        var sz = try self.getSupposedSize();
         std.log.debug("Pt: {},{} - Sz: {},{}", .{ pt.x, pt.y, sz.cx, sz.cy });
 
-        // TODO: https://github.com/JerwuQu/wblocks2/blob/master/src/main.cpp#L152
+        // Create bitmap
+        if (self.barBitmap == null or sz.cx != self.drawSize.cx or sz.cy != self.drawSize.cy) {
+            std.log.debug("Creating bitmap", .{});
+            self.drawSize = sz;
+            if (self.barBitmap) |bm| {
+                _ = wingdi.DeleteObject(bm);
+            }
+            self.barBitmap = wingdi.CreateCompatibleBitmap(self.screenDC, sz.cx, sz.cy);
+            _ = wingdi.SelectObject(self.barDC, self.barBitmap);
+        }
+
+        // Draw blocks
+        {
+            std.log.debug("Drawing blocks", .{});
+            self.manager.mutex.lock();
+            defer self.manager.mutex.unlock();
+            var rect = winfon.RECT{ .left = 0, .top = 0, .right = sz.cx, .bottom = sz.cy };
+            _ = wingdi.SetBkMode(self.barDC, .TRANSPARENT);
+            for (self.manager.blocks.items) |block| {
+                if (block.visible) {
+                    rect.right -= block.padRight;
+                    _ = wingdi.SetTextColor(self.barDC, block.color);
+                    _ = wingdi.SelectObject(self.barDC, block.font.handle);
+                    const DTF = wingdi.DRAW_TEXT_FORMAT;
+                    const drawFlags = @intToEnum(DTF, @enumToInt(DTF.NOCLIP) | @enumToInt(DTF.NOPREFIX) |
+                        @enumToInt(DTF.SINGLELINE) | @enumToInt(DTF.RIGHT) | @enumToInt(DTF.VCENTER));
+                    const calcFlags = @intToEnum(DTF, @enumToInt(drawFlags) | @enumToInt(DTF.CALCRECT));
+                    _ = wingdi.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &rect, drawFlags);
+                    var rectCalc = rect;
+                    _ = wingdi.DrawTextW(self.barDC, block.wtext, @intCast(i32, block.wtext.len), &rectCalc, calcFlags);
+                    rect.right -= rectCalc.right + block.padLeft;
+                }
+            }
+        }
+
+        // Update window
+        var blendfn = wingdi.BLENDFUNCTION{
+            .BlendOp = wingdi.AC_SRC_OVER,
+            .BlendFlags = 0,
+            .SourceConstantAlpha = 255,
+            .AlphaFormat = wingdi.AC_SRC_ALPHA,
+        };
+        var ptSrc = std.mem.zeroes(winfon.POINT);
+        _ = winwin.UpdateLayeredWindow(self.wnd, self.screenDC, &pt, &sz, self.barDC, &ptSrc, 0, &blendfn, .ALPHA);
     }
 };
 
@@ -411,12 +472,12 @@ const JSState = struct {
         return @ptrCast(*Block, @alignCast(@alignOf(*Block), QJSC.JS_GetOpaque(this, self.blockClassId)));
     }
     fn jsCloneBlock(self: *JSState, block: *const Block) !QJSC.JSValue {
+        self.manager.jsBeginUpdate();
+        defer self.manager.jsEndUpdate();
+
         var clone = try block.clone();
         const obj = QJSC.JS_NewObjectClass(self.js.ctx, @intCast(c_int, self.blockClassId));
         QJSC.JS_SetOpaque(obj, clone);
-
-        self.manager.beginUpdate();
-        defer self.manager.endUpdate();
         try self.manager.blocks.append(gpalloc, clone);
 
         return obj;
@@ -434,8 +495,9 @@ const JSState = struct {
         return self.jsCloneBlock(self.jsGetThisBlock(this));
     }
     fn js_BlockDestroy(self: *JSState, this: QJSC.JSValue) void {
-        self.manager.beginUpdate();
-        defer self.manager.endUpdate();
+        self.manager.jsBeginUpdate();
+        defer self.manager.jsEndUpdate();
+
         var block = self.jsGetThisBlock(this);
         block.destroy();
         const idx = std.mem.indexOfScalar(*Block, self.manager.blocks.items, block);
@@ -444,8 +506,9 @@ const JSState = struct {
         }
     }
     fn js_BlockSetText(self: *JSState, this: QJSC.JSValueConst, text: []const u8) !void {
-        self.manager.beginUpdate();
-        defer self.manager.endUpdate();
+        self.manager.jsBeginUpdate();
+        defer self.manager.jsEndUpdate();
+
         var block = self.jsGetThisBlock(this);
         try block.setText(text);
     }
