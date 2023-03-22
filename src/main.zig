@@ -381,7 +381,7 @@ const BarWindow = struct {
             }
             gpAssert(@src(), C.GdipCreateFromHDC(self.barDC, &self.gfx));
             gpAssert(@src(), C.GdipSetSmoothingMode(self.gfx, C.SmoothingModeAntiAlias8x8));
-            gpAssert(@src(), C.GdipSetTextRenderingHint(self.gfx, C.TextRenderingHintAntiAlias));
+            gpAssert(@src(), C.GdipSetTextRenderingHint(self.gfx, C.TextRenderingHintAntiAliasGridFit));
         }
 
         // Draw blocks
@@ -394,10 +394,11 @@ const BarWindow = struct {
             for (self.manager.blocks.items) |block| {
                 if (block.visible) {
                     rect.Width -= @intToFloat(f32, block.padRight);
+
                     var format: ?*C.GpStringFormat = null;
-                    gpAssert(@src(), C.GdipStringFormatGetGenericDefault(&format));
+                    gpAssert(@src(), C.GdipStringFormatGetGenericTypographic(&format));
                     defer _ = C.GdipDeleteStringFormat(format);
-                    gpAssert(@src(), C.GdipSetStringFormatFlags(format, C.StringFormatFlagsNoFitBlackBox | C.StringFormatFlagsNoWrap | C.StringFormatFlagsNoClip));
+                    gpAssert(@src(), C.GdipSetStringFormatFlags(format, C.StringFormatFlagsNoFitBlackBox | C.StringFormatFlagsNoWrap | C.StringFormatFlagsNoClip | C.StringFormatFlagsLineLimit));
                     gpAssert(@src(), C.GdipSetStringFormatAlign(format, C.StringAlignmentFar));
                     gpAssert(@src(), C.GdipSetStringFormatLineAlign(format, C.StringAlignmentCenter));
                     gpAssert(@src(), C.GdipDrawString(self.gfx, block.wtext, @intCast(c_int, block.wtext.len), block.font.font, &rect, format, block.brush));

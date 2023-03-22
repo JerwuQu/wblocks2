@@ -51,11 +51,11 @@ console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
 
 console.log("Hello from lib.mjs!");
 const a = wb.createBlock();
-a.setFont('Comic Sans MS', 30);
+a.setFont('Comic Sans MS', 25);
 a.setColor(255, 0, 0, 255);
 a.setText('Red');
 const b = wb.createBlock();
-b.setFont('Arial Black', 30);
+b.setFont('Arial Black', 25);
 b.setColor(0, 255, 0, 255);
 b.setText('Green');
 const c = wb.createBlock();
@@ -63,11 +63,16 @@ c.setColor(0, 0, 255, 255);
 c.setText('Blue');
 const d = wb.createBlock();
 d.setColor(255, 255, 255, 100);
+d.setFont('Courier New', 25);
 d.setPadding(20, 20);
 d.setText('Alpha');
 const e = wb.createBlock();
 e.setVisible(false);
 e.setText('Invisible');
+const f = wb.createBlock();
+f.setFont('Consolas', 8);
+f.setColor(255, 255, 255, 255);
+f.setText('White');
 
 // Load all scripts within the `blocks` dir
 // const [files, err] = os.readdir('./blocks');
