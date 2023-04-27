@@ -3,48 +3,34 @@ import * as os from 'os';
 globalThis.std = std;
 globalThis.os = os;
 
+// setInterval polyfill ---------------------------------------------------- //
+let intervalCount = 0;
+const intervalMap = {};
 globalThis.setInterval = (fn, interval) => {
+    let id = ++intervalCount;
     const wfn = () => {
+        intervalMap[id] = os.setTimeout(wfn, interval);
         fn();
-        os.setTimeout(wfn, interval);
     };
-    os.setTimeout(wfn, interval);
+    intervalMap[id] = os.setTimeout(wfn, interval);
+    return id;
 };
-// TODO: clearInterval
-setInterval(wb.internal.yield, 10);
-
-globalThis.$quote = arg => {
-    // Sources:
-    // - https://stackoverflow.com/a/47469792
-    // - https://docs.microsoft.com/en-gb/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
-    if (!(/[ \t\n\v]/.exec(arg))) {
-        return arg;
-    }
-    let str = '"';
-    for (let i = 0; i < arg.length; i++) {
-        let slashes = 0;
-        while (i < arg.length && arg[i] === '\\') {
-            slashes++;
-            i++;
-        }
-        if (i === arg.length) {
-            str += '\\'.repeat(slashes * 2);
-            break;
-        } else if (arg[i] === '"') {
-            str += '\\'.repeat(slashes * 2 + 1) + arg[i];
-        } else {
-            str += '\\'.repeat(slashes) + arg[i];
-        }
-    }
-    return str + '"';
+globalThis.clearInterval = id => {
+    if (intervalMap[id] === undefined) return;
+    os.clearTimeout(intervalMap[id]);
+    delete intervalMap[id];
 };
+// ------------------------------------------------------------------------- //
 
+globalThis.$quote = wb.internal.shell_quote;
 globalThis.$ps = async cmd => await $(`powershell -Command ${globalThis.$quote(cmd)}`);
 
 globalThis.$psFetch = async url => {
     const cmd = `$ProgressPreference='SilentlyContinue';$(Invoke-WebRequest '${url.replace(/'/g, "''")}').Content`;
     return await globalThis.$ps(cmd);
 };
+
+setInterval(wb.internal.yield, 10);
 
 // TODO: colored info, warn, error
 console.error = (...args) => std.err.printf('%s\n', args.join(' '));;
@@ -73,6 +59,8 @@ const f = wb.createBlock();
 f.setFont('Consolas', 8);
 f.setColor(255, 255, 255, 255);
 f.setText('White');
+
+console.log($quote('"Yo \\" hello oo"'))
 
 // Load all scripts within the `blocks` dir
 // const [files, err] = os.readdir('./blocks');

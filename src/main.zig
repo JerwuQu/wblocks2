@@ -454,6 +454,7 @@ const JSState = struct {
         const wbInternal = QJSC.JS_NewObject(js.ctx);
         _ = QJSC.JS_SetPropertyStr(js.ctx, wb, "internal", wbInternal);
         try js.addFunction(wbInternal, "yield", js_yield);
+        try js.addFunction(wbInternal, "shell_quote", js_shell_quote);
 
         // Register Block class
         _ = QJSC.JS_NewClassID(&self.blockClassId);
@@ -509,6 +510,38 @@ const JSState = struct {
     fn js_yield(self: *JSState) void {
         // TODO
         _ = self;
+    }
+    fn js_shell_quote(self: *JSState, text: [:0]const u8) ![:0]const u8 {
+        _ = self;
+        // Sources:
+        // - https://stackoverflow.com/a/47469792
+        // - https://docs.microsoft.com/en-gb/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+        if (std.mem.indexOfAny(u8, text, " \t\n") == null) {
+            return text;
+        }
+        // TODO: free how? currently leaks
+        var list = try std.ArrayList(u8).initCapacity(gpalloc, text.len);
+        try list.append('"');
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            var slashes: usize = 0;
+            while (i < text.len and text[i] == '\\') {
+                slashes += 1;
+                i += 1;
+            }
+            if (i == text.len) {
+                try list.appendNTimes('\\', slashes * 2);
+                break;
+            } else if (text[i] == '"') {
+                try list.appendNTimes('\\', slashes * 2 + 1);
+                try list.append(text[i]);
+            } else {
+                try list.appendNTimes('\\', slashes);
+                try list.append(text[i]);
+            }
+        }
+        try list.append('"');
+        return try list.toOwnedSliceSentinel(0);
     }
     fn js_createBlock(self: *JSState) !QJSC.JSValue {
         return self.jsCloneBlock(try Block.getDefault());
